@@ -39,7 +39,7 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "10.7";
+const char* FW_VERSION = "10.8";
 const char* WIFI_AP_PASS = "dosapalm2026";
 const uint8_t  WIFI_CHAN = 6;
 const uint16_t TCP_PORT  = 3333;
@@ -214,6 +214,10 @@ void setOperacion(bool on);   // definida junto a los servicios de LED
 // v9.7: reenvio diferido de la linea de completado (robustez ante BLE).
 String   finRepetir = "";
 uint32_t finRepetirAt = 0;
+// v10.8: reenvio diferido del cambio de OPERACION — una notificacion BLE
+// perdida dejaba a la app sin enterarse de que la operacion termino.
+String   opRepetir = "";
+uint32_t opRepetirAt = 0;
 
 // v9.6: respaldo OPCIONAL de eventos en microSD (ademas de LittleFS, que
 // SIEMPRE guarda). Configurable con `sd on|off` (persistente). CS en GPIO 5
@@ -316,7 +320,9 @@ void setOperacion(bool on) {
     digitalWrite(PIN_LED_R, runMode == MODE_REAL ? HIGH : LOW);
     digitalWrite(PIN_LD, ldOn ? HIGH : LOW);   // v10.0: el LD vuelve a su estado manual
   }
-  logln(String("OPERACION: ") + (on ? "ACTIVA (LED rojo y LD titilando 300 ms)" : "DETENIDA"));
+  String msg = String("OPERACION: ") + (on ? "ACTIVA (LED rojo y LD titilando 300 ms)" : "DETENIDA");
+  logln(msg);
+  opRepetir = msg; opRepetirAt = millis() + 700;   // v10.8: repetir por robustez BLE
 }
 
 // v9.4/v10.0: titileo del LED rojo (GPIO26) Y del LD, JUNTOS, cada 300 ms
@@ -987,6 +993,16 @@ void handleCommand(String cmd, int ch) {
       logln("Duty fijo dosificacion = " + String(dutyFijoPct) + "% (constante, sin lazo)");
     }
   }
+  else if (t[0] == "memoria") {
+    // v10.8: distribucion de la memoria — foco en el % usado por los datos
+    // de sesiones (archivo de eventos) dentro de la particion de datos.
+    size_t fsTot = LittleFS.totalBytes(), fsUsed = LittleFS.usedBytes();
+    size_t evSz = 0; { File f = LittleFS.open(EVT_FILE, FILE_READ); if (f) { evSz = f.size(); f.close(); } }
+    out.printf("MEMORIA: flash %u KB | datos_total %u KB | datos_usados %u KB (%u%%) | sesiones %u B (%u%% de datos) | eventos %lu | ram_libre %u KB\n",
+      (unsigned)(ESP.getFlashChipSize()/1024), (unsigned)(fsTot/1024), (unsigned)(fsUsed/1024),
+      (unsigned)(fsTot ? (fsUsed*100)/fsTot : 0), (unsigned)evSz,
+      (unsigned)(fsTot ? (evSz*100)/fsTot : 0), (unsigned long)evtCount(), (unsigned)(ESP.getFreeHeap()/1024));
+  }
   else if (t[0] == "rebote") {
     // v10.3: presion minima del pulsador (antirebote/antirruido, persistente)
     uint32_t ms = (uint32_t) t[1].toInt();
@@ -1334,6 +1350,7 @@ void loop() {
   opLedService();   // v9.4: titileo del LED rojo mientras hay OPERACION
   bleLedService();  // v10.0: LED azul = Bluetooth (titila en espera, fijo conectado)
   if (finRepetirAt && millis() >= finRepetirAt) { finRepetirAt = 0; logln(finRepetir); }   // v9.7
+  if (opRepetirAt && millis() >= opRepetirAt) { opRepetirAt = 0; logln(opRepetir); }       // v10.8
   if (wifiActive) wsServer.loop();
   connService();
   bleConnLogService();
