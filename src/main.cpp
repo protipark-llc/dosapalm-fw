@@ -39,7 +39,7 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "10.9";
+const char* FW_VERSION = "11.0";
 const char* WIFI_AP_PASS = "dosapalm2026";
 const uint8_t  WIFI_CHAN = 6;
 const uint16_t TCP_PORT  = 3333;
@@ -466,7 +466,9 @@ void evtAck(uint32_t upTo) {
 /**
  * v8/P0-3: linea canonica del evento de dosificacion. Se emite por el canal
  * activo Y se persiste en LittleFS (sobrevive reinicios y ausencia de app).
- * EVT,<seq>,<ms>,<gramos>,<pulsos>,<fix>,<lat>,<lon>,<turb%>,<tini>,<tfin>,<retardo>,<resultado>
+ * EVT,<seq>,<ms>,<gramos>,<pulsos>,<fix>,<lat>,<lon>,<turb%>,<tini>,<tfin>,<retardo>,<resultado>,<fechahora>
+ * v11.0: <fechahora> = hora UTC del GPS (ISO, "-" sin señal). Cuando la
+ * tarjeta tenga RTC, solo cambia la fuente de este campo.
  */
 void emitDoseEvent(uint32_t pulses, float grams, const char* resultado) {
   evtSeq++;
@@ -474,10 +476,16 @@ void emitDoseEvent(uint32_t pulses, float grams, const char* resultado) {
   bool fix = gps.location.isValid();
   double la = fix ? gps.location.lat() : (hasLastFix ? lastFixLat : 0.0);
   double lo = fix ? gps.location.lng() : (hasLastFix ? lastFixLon : 0.0);
-  char line[170];
-  snprintf(line, sizeof(line), "EVT,%lu,%lu,%.0f,%lu,%d,%.6f,%.6f,%d,%d,%d,%d,%s",
+  char ts[24] = "-";
+  if (gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2020) {
+    snprintf(ts, sizeof(ts), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             gps.date.year(), gps.date.month(), gps.date.day(),
+             gps.time.hour(), gps.time.minute(), gps.time.second());
+  }
+  char line[200];
+  snprintf(line, sizeof(line), "EVT,%lu,%lu,%.0f,%lu,%d,%.6f,%.6f,%d,%d,%d,%d,%s,%s",
            (unsigned long)evtSeq, (unsigned long)millis(), grams, (unsigned long)pulses,
-           fix ? 1 : 0, la, lo, turbRealPct, tIniMs, tFinMs, retardoMs, resultado);
+           fix ? 1 : 0, la, lo, turbRealPct, tIniMs, tFinMs, retardoMs, resultado, ts);
   out.println(line);
   evtAppend(String(line));
 }
