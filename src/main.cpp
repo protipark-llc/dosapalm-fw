@@ -39,7 +39,7 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "10.8";
+const char* FW_VERSION = "10.9";
 const char* WIFI_AP_PASS = "dosapalm2026";
 const uint8_t  WIFI_CHAN = 6;
 const uint16_t TCP_PORT  = 3333;
@@ -315,6 +315,9 @@ void sdMount() {
 }
 
 void setOperacion(bool on) {
+  // v10.9: una tarjeta SIN CONFIGURAR tampoco puede entrar en OPERACION —
+  // primero hay que enviarle la configuracion desde la app.
+  if (on && !cfgOk) { logln("OPERACION BLOQUEADA: tarjeta SIN CONFIGURAR - primero envia la configuracion desde la app"); return; }
   opActive = on;   // v10.7: NO se persiste — cada encendido arranca sin operacion
   if (!on) {
     digitalWrite(PIN_LED_R, runMode == MODE_REAL ? HIGH : LOW);
