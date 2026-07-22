@@ -1,0 +1,1357 @@
+/*
+ * ============================================================
+ *  DOSAPALM V1 — FIRMWARE v8  (base: protocolo de pruebas v7)
+ *  Board cliente ESP32-WROVER + L86 — Protipark S.A.S.
+ *  Core esp32 3.x | Partition: Huge APP (3MB No OTA/1MB LittleFS)
+ *  Libs: TinyGPSPlus | WebSockets (Markus Sattler) | BLE del core
+ * ============================================================
+ *  CAMBIOS v8 (ver docs/solicitud-cambios-firmware.md):
+ *   P0-1  Persistencia de eventos en LittleFS + 'evt count|since|ack'
+ *   P0-2  SSID del AP = serial del equipo (DOSAPALM-XXXX), no constante
+ *   P0-3  Linea EVT con GPS (o ultimo punto conocido) al terminar cada dosis
+ *   P1-4  Dosis redondeada al pulso MAS CERCANO (v7 truncaba: 15 g -> 14 g)
+ *   P1-5  'retardo' = intervalo objetivo entre pulsos hall; lazo de control
+ *         ajusta el PWM del dosificador (P) + guardian de atasco escalado
+ *   P1-6  'clave' obligatoria tambien en WebSocket y BLE (v7: solo TCP)
+ *   P1-7  'hall reset' rechazado durante una dosificacion (evita sobredosis)
+ *   P2-9  parser de 'seq run' tolera tokens sin ':'
+ *  Sin cambios: dosificacion por conteo hall, conexion unica BLE/WiFi,
+ *  turbina hasta 100% (maximo RECOMENDADO 78%), protocolo de texto por lineas.
+ * ============================================================
+ */
+
+#include <Arduino.h>
+#include <TinyGPSPlus.h>
+#include <WiFi.h>
+#include <Preferences.h>
+#include <WebSocketsServer.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <LittleFS.h>
+#include <SD.h>   // v9.6: respaldo opcional de eventos en microSD
+
+// ---------------- CONFIG ----------------
+/*
+ * ESTE es el ÚNICO firmware del proyecto (fuente: dosapalm/firmware/src/main.cpp).
+ * Subir el numero en CADA cambio: la app verifica la version al conectar y
+ * avisa si la tarjeta esta desactualizada. El comando `version` responde
+ * "VERSION <n>" y la app lo parsea.
+ */
+const char* FW_VERSION = "10.7";
+const char* WIFI_AP_PASS = "dosapalm2026";
+const uint8_t  WIFI_CHAN = 6;
+const uint16_t TCP_PORT  = 3333;
+const uint16_t WS_PORT   = 81;
+const char* ACCESS_KEY   = "1234";
+
+#define NUS_SERVICE_UUID "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#define NUS_RX_UUID      "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+#define NUS_TX_UUID      "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+
+// ---------------- PINES ----------------
+#define PIN_LED_R 26
+#define PIN_LED_B 27
+#define PIN_LED_G 33
+#define PIN_TURB  32
+#define PIN_DOSF  13
+#define PIN_TOL   15
+#define PIN_AUX   25
+#define PIN_LD    19
+#define PIN_BTN   35
+#define PIN_HALL  21
+#define GPS_RX    4
+#define GPS_TX    5
+
+// ---------------- PWM / LIMITES ----------------
+const int RES_TURB = 8, RES_MOT = 8;
+// v8.4: frecuencia PWM CONFIGURABLE por motor ('freq <motor> <hz>', persistente
+// en NVS). Aplica igual a pruebas y a la dosificacion real. Defaults del v7.
+uint32_t freqTurb = 5000, freqDosf = 1000, freqTol = 1000;
+// v8.9: la turbina admite hasta el 100% (255). El maximo RECOMENDADO sigue
+// siendo 78% (199/255) — por encima se avisa pero no se bloquea.
+const int      TURB_DUTY_MAX  = 255;
+const int      TURB_PCT_RECOM = 78;
+const int      TURB_RAMP_STEP = 5;
+const uint32_t TURB_RAMP_MS   = 40;
+
+const float    GRAMS_PER_PULSE = 2.0;
+bool dosfStallGuard = true;
+
+// v8.3: guardian de atasco VARIABLE ('atasco <ms>', persistente en NVS).
+// Con carga real el arranque puede tardar mas que los 4 s fijos que traia el v7.
+uint32_t hallTimeoutMs = 4000;
+
+// v8.3: arranque asistido — el piso del 60% puede no vencer la friccion
+// estatica con carga. Patada inicial + escalada de duty hasta el primer pulso.
+const uint32_t KICK_MS           = 300;  // patada al 100% al encender el dosf
+const uint32_t ARRANQUE_STEP_MS  = 700;  // cada cuanto sube el duty si no hay pulsos
+const float    ARRANQUE_STEP     = 20.0f; // cuanto sube por paso (~8%)
+uint32_t kickUntil = 0;
+uint32_t arranqueNextMs = 0;
+
+// v8/P1-5: lazo de control del retardo entre cavidades.
+// KP sigue PROVISIONAL (calibrar). El piso del dosificador ya ES dato de campo:
+const float KP_RETARDO    = 0.08f;  // duty por ms de error
+// CALIBRADO EN CAMPO (11 jul 2026, ajustado con la tabla real de calibracion:
+// la maquina necesita 95-100%% de duty para operar; piso de seguridad al 70%%).
+const int   DOSF_PCT_MIN  = 70;                      // % minimo operativo
+const int   DOSF_DUTY_MIN = (255 * DOSF_PCT_MIN)/100; // = 153 (piso del lazo)
+
+// ---------------- SECUENCIADOR ----------------
+enum Act : uint8_t { A_END, A_LEDR, A_LEDG, A_LEDB, A_LEDALL, A_LD, A_AUX, A_TURB, A_DOSF, A_TOL, A_REPORT, A_IDENTNOTE };
+struct Step { uint8_t act; int16_t val; uint32_t dur; };
+
+// ---------------- CONEXION (una a la vez) ----------------
+enum ConnMode : uint8_t { CONN_BLE = 0, CONN_WIFI = 1 };
+ConnMode connMode = CONN_BLE;
+bool bleActive = false, wifiActive = false;
+
+WiFiServer tcpServer(TCP_PORT);
+WiFiClient tcpClient;
+WebSocketsServer wsServer(WS_PORT);
+BLECharacteristic* pTxChar = nullptr;
+volatile bool bleConnected = false;
+void bleNotifyLine(const char* s, size_t n);   // fwd
+
+class MultiOut : public Print {
+  char lineBuf[220]; size_t lineLen = 0;
+  void lineFlush() {
+    if (lineLen == 0) return;
+    lineBuf[lineLen] = '\0';
+    if (wifiActive) wsServer.broadcastTXT(lineBuf);
+    if (bleActive)  bleNotifyLine(lineBuf, lineLen);
+    lineLen = 0;
+  }
+ public:
+  size_t write(uint8_t c) override {
+    Serial.write(c);
+    if (wifiActive && tcpClient && tcpClient.connected()) tcpClient.write(c);
+    if (c == '\n') lineFlush();
+    else if (c != '\r' && lineLen < sizeof(lineBuf) - 1) lineBuf[lineLen++] = (char)c;
+    return 1;
+  }
+  size_t write(const uint8_t* b, size_t s) override { for (size_t i = 0; i < s; i++) write(b[i]); return s; }
+};
+MultiOut out;
+
+// ---------------- CANALES ----------------
+enum { CH_USB = 0, CH_BT = 1, CH_TCP = 2, CH_WS = 3, N_CH = 4 };
+const char* chName[N_CH] = {"USB", "BLE", "TCP", "WS"};
+// v8/P1-6: solo el USB fisico entra autorizado. BLE, TCP y WS exigen 'clave'.
+bool  authed[N_CH] = {true, false, false, false};
+char  bufs[N_CH][80];
+size_t lens[N_CH] = {0, 0, 0, 0};
+
+volatile char     bleRing[256];
+volatile uint16_t bleHead = 0, bleTail = 0;
+
+// ---------------- ESTADO ----------------
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);
+
+int  turbPct = 0, dosfPct = 0, tolPct = 0;
+bool auxOn = false, ldOn = false, logOn = false;
+
+volatile uint32_t hallCount = 0;
+volatile uint32_t hallLastPulseMs = 0;
+uint32_t dosfStartMs = 0, dosfPulsesAtStart = 0;
+bool     bootLedDone = false;
+
+enum RunMode : uint8_t { MODE_NONE, MODE_TEST, MODE_REAL };
+// v9.0: la tarjeta ARRANCA en MODO REAL (el pulsador fisico dosifica sin
+// configurar nada). Se cambia con 'modo prueba' / 'modo real' (app o serial).
+RunMode  runMode = MODE_REAL;
+
+bool     monOn = true;
+uint32_t monIntervalMs = 5000;
+uint32_t tMon = 0;
+bool monV_turb=true, monV_dosf=true, monV_tol=true, monV_hall=true, monV_btn=true, monV_gps=true, monV_ble=true, monV_seq=true;
+
+bool     configMode = false;
+uint32_t tCfgBlink = 0;
+Preferences prefs;
+String   devSerial;
+
+uint32_t turbOffAt = 0, dosfOffAt = 0, tolOffAt = 0;
+uint32_t hallCountWindow = 0, hallWindowStart = 0;
+float    hallHz = 0;
+uint32_t tLog = 0, gpsRawUntil = 0;
+
+uint32_t greenPulseUntil = 0;
+uint32_t tBlueBlink = 0;
+
+// Dosificacion (modo real)
+int dosisG   = 15;
+int retardoMs = 100;    // v8: intervalo OBJETIVO entre pulsos hall (0 = sin control)
+int tIniMs   = 2500;
+int tFinMs   = 3500;
+int turbRealPct = 40;
+int dosfRealPct = 70, tolRealPct = 60;
+// v9.1: ANTI-REPETICION. Con la turbina a alta potencia el ruido electrico
+// puede inducir pulsos falsos en el pulsador RF y relanzar ciclos sin fin.
+// Tras terminar (o parar) un ciclo, TODO arranque queda bloqueado durante
+// rearmeMs (configurable con `rearme <ms>`, persistente; 0 = sin bloqueo).
+// Ademas el pulsador exige una presion minima real (btnMinMs, configurable).
+uint32_t lastCycleEndMs = 0;
+uint32_t rearmeMs = 5000;
+
+// v9.2: bandera de tarjeta CONFIGURADA. Nace en false (tarjeta nueva o memoria
+// borrada); la app la consulta con `configurado` al conectar y la marca con
+// `configurado ok` despues de enviar toda la configuracion desde su vista.
+bool cfgOk = false;
+
+// v9.4: estado constante de OPERACION (toma de datos). Mientras esta activo,
+// el LED rojo (GPIO26) titila cada 300 ms. Persistente en NVS. Se activa desde
+// la app (`operacion on`) o sosteniendo el pulsador fisico opHoldMs.
+bool     opActive = false;
+uint32_t opHoldMs = 5000;   // pulsacion sostenida para alternar OPERACION (configurable)
+uint32_t btHoldMs = 3000;   // pulsacion sostenida para alternar BLUETOOTH/config (configurable)
+
+void setOperacion(bool on);   // definida junto a los servicios de LED
+
+// v9.7: reenvio diferido de la linea de completado (robustez ante BLE).
+String   finRepetir = "";
+uint32_t finRepetirAt = 0;
+
+// v9.6: respaldo OPCIONAL de eventos en microSD (ademas de LittleFS, que
+// SIEMPRE guarda). Configurable con `sd on|off` (persistente). CS en GPIO 5
+// (VSPI estandar: SCK 18, MISO 19, MOSI 23) — validar contra el hardware real.
+#define SD_CS 5
+bool sdEnabled = false;
+bool sdOk = false;
+// v10.3: presion minima del pulsador (antirebote/antirruido) CONFIGURABLE
+// desde la app con `rebote <ms>` (persistente). Pulsos mas cortos se descartan.
+uint32_t btnMinMs = 150;
+
+// v8.8: duty FIJO para la dosificacion (viene de la tabla de calibracion).
+// >0 = el dosificador corre a ese % CONSTANTE durante toda la aplicacion (sin
+// lazo de control, sin variacion). 0 = lazo proporcional de siempre.
+// Persistente en NVS: el boton fisico dosifica igual tras un reinicio.
+int dutyFijoPct = 0;
+enum DosState : uint8_t { DOS_IDLE, DOS_WARMUP, DOS_DOSING, DOS_CLEAN };
+DosState dosState = DOS_IDLE;
+uint32_t dosT = 0, dosTargetPulses = 0, dosStartPulses = 0;
+
+// v8/P1-5: estado del lazo de control
+float    ctrlDutyF = 0;
+uint32_t ctrlPrevPulseMs = 0;
+uint32_t ctrlPrevCount = 0;
+
+// v8: calibracion del retardo SOLO con el dosificador. La turbina y la tolva
+// NO se encienden: se mide la cadencia del motor dosificador con el lazo activo.
+bool     calActive = false;
+int      calRetardoMs = 0;
+uint32_t calTargetPulses = 0;
+// v8.6: el duty CALIBRADO es el PROMEDIO de las lecturas cuyo intervalo quedo
+// dentro del +/-15%% del objetivo (no el ultimo valor del lazo).
+float    calDutySum = 0;
+uint32_t calDutyN = 0;
+
+// v8/P0-3: ultimo fix valido para georreferenciar bajo palma
+double lastFixLat = 0, lastFixLon = 0;
+bool   hasLastFix = false;
+
+// v8/P0-1: persistencia de eventos
+const char* EVT_FILE = "/events.csv";
+uint32_t evtSeq = 0;
+
+void IRAM_ATTR hallISR() { hallCount++; hallLastPulseMs = millis(); }
+
+void logln(const String &s) { out.print("["); out.print(millis()); out.print("] "); out.println(s); }
+int pctToDuty(int pct, int cap) { pct = constrain(pct, 0, 100); return min((int)map(pct, 0, 100, 0, 255), cap); }
+
+/*
+ * LECCIONES DE CAMPO sobre el PWM de motores (11 jul 2026):
+ *  1) NO usar ledcDetach/ledcAttach en caliente: el "apagado duro" cruzo el PWM
+ *     de la turbina hacia DOSF/TOL (zumbido y LEDs espejo proporcionales a la
+ *     potencia). Los pines quedan SIEMPRE adjuntos y duty 0 = LOW activo (v7).
+ *  2) Los canales/timers se asignan EXPLICITOS en setup() (ledcAttachChannel):
+ *     la turbina (5 kHz) en su propio timer, dosificador y tolva (1 kHz) en
+ *     otro. Con la asignacion automatica, segun la version del core, un canal
+ *     vecino puede compartir timer con la turbina y arrastrar su senal.
+ */
+
+/*
+ * v8.5: TODA escritura de PWM al dosificador pasa por dosfWrite(), para poder
+ * reportar en tiempo real el duty que sale del GPIO (patada, 90% inicial,
+ * escalada de arranque, lazo de control y apagado). La app lo pinta en vivo.
+ */
+int dosfAppliedDuty = 0;
+void dosfWrite(int duty) {
+  ledcWrite(PIN_DOSF, duty);
+  dosfAppliedDuty = duty;
+}
+void logln(const String &s); // fwd
+void dutyReportService() {
+  static int last = -1;
+  static uint32_t tNext = 0;
+  if (dosfAppliedDuty == last || millis() < tNext) return;
+  last = dosfAppliedDuty;
+  tNext = millis() + 150;   // limite de tasa: no inundar el canal
+  int pct = (int)((dosfAppliedDuty * 100.0f) / 255.0f + 0.5f);
+  logln("CTRL: duty " + String(pct) + "% (" + String(dosfAppliedDuty) + "/255) | gpio");
+}
+
+// ---------------- LEDs ----------------
+int turbDutyNow = 0, turbDutyTarget = 0;
+void ledMirror() {
+  if (runMode == MODE_REAL) { if (!opActive) digitalWrite(PIN_LED_R, HIGH); return; }
+  if (!opActive) digitalWrite(PIN_LED_R, (turbDutyNow > 0 || turbDutyTarget > 0) ? HIGH : LOW);
+  // v10.0: con radio BLE, el azul es del Bluetooth — el espejo de la tolva no lo pisa
+  if (!(connMode == CONN_BLE && bleActive)) digitalWrite(PIN_LED_B, (tolPct  > 0) ? HIGH : LOW);
+  digitalWrite(PIN_LED_G, (dosfPct > 0) ? HIGH : LOW);
+}
+
+void sdMount() {
+  sdOk = SD.begin(SD_CS);
+  logln(sdOk ? "SD: microSD montada (respaldo en /eventos.csv)"
+             : "SD: no se detecto microSD (CS=5) — el respaldo queda en espera");
+}
+
+void setOperacion(bool on) {
+  opActive = on;   // v10.7: NO se persiste — cada encendido arranca sin operacion
+  if (!on) {
+    digitalWrite(PIN_LED_R, runMode == MODE_REAL ? HIGH : LOW);
+    digitalWrite(PIN_LD, ldOn ? HIGH : LOW);   // v10.0: el LD vuelve a su estado manual
+  }
+  logln(String("OPERACION: ") + (on ? "ACTIVA (LED rojo y LD titilando 300 ms)" : "DETENIDA"));
+}
+
+// v9.4/v10.0: titileo del LED rojo (GPIO26) Y del LD, JUNTOS, cada 300 ms
+// mientras hay OPERACION — corre en CUALQUIER modo (indicador de toma de datos).
+void opLedService() {
+  static uint32_t tOpBlink = 0;
+  if (!opActive || configMode) return;
+  if (millis() - tOpBlink >= 300) {
+    tOpBlink = millis();
+    int v = !digitalRead(PIN_LED_R);
+    digitalWrite(PIN_LED_R, v);
+    digitalWrite(PIN_LD, v);
+  }
+}
+
+// v10.0: LED AZUL = estado del BLUETOOTH, en cualquier modo (si la radio es BLE):
+// titilando = esperando conexion | fijo = conectado a otro dispositivo.
+void bleLedService() {
+  static uint32_t tBlink = 0;
+  if (configMode || connMode != CONN_BLE || !bleActive) return;
+  if (bleConnected) digitalWrite(PIN_LED_B, HIGH);
+  else if (millis() - tBlink >= 350) { tBlink = millis(); digitalWrite(PIN_LED_B, !digitalRead(PIN_LED_B)); }
+}
+
+void realLedService() {
+  if (runMode != MODE_REAL || configMode) return;
+  if (!opActive) digitalWrite(PIN_LED_R, HIGH);
+  digitalWrite(PIN_LED_G, (millis() < greenPulseUntil) ? HIGH : LOW);
+  // v10.0: el azul lo maneja bleLedService (Bluetooth); aqui solo se apaga
+  // cuando la radio activa es Wi-Fi.
+  if (!(connMode == CONN_BLE && bleActive)) {
+    digitalWrite(PIN_LED_B, LOW);
+  }
+}
+
+// ---------------- FSM turbina ----------------
+uint32_t tTurbRamp = 0;
+void setTurb(int pct) {
+  turbPct = constrain(pct, 0, 100);
+  turbDutyTarget = pctToDuty(turbPct, TURB_DUTY_MAX);
+  ledMirror();
+  logln("TURB objetivo=" + String(turbPct) + "% (duty " + String(turbDutyTarget) + "/255, tope " + String(TURB_DUTY_MAX) + ") - rampa en curso");
+  if (turbPct > TURB_PCT_RECOM) logln("AVISO: turbina por encima del maximo recomendado (" + String(TURB_PCT_RECOM) + "%)");
+}
+void turbUpdate() {
+  if (turbDutyNow == turbDutyTarget) return;
+  if (millis() - tTurbRamp < TURB_RAMP_MS) return;
+  tTurbRamp = millis();
+  if (turbDutyNow < turbDutyTarget) turbDutyNow = min(turbDutyNow + TURB_RAMP_STEP, turbDutyTarget);
+  else                              turbDutyNow = max(turbDutyNow - TURB_RAMP_STEP, turbDutyTarget);
+  ledcWrite(PIN_TURB, turbDutyNow);
+  ledMirror();
+  if (turbDutyNow == turbDutyTarget) logln("TURB rampa completada");
+}
+void setDosf(int pct) {
+  pct = constrain(pct, 0, 100);
+  // Piso de campo: bajo DOSF_PCT_MIN el motor zumba sin girar. O apagado, o >= piso.
+  if (pct > 0 && pct < DOSF_PCT_MIN) {
+    pct = DOSF_PCT_MIN;
+    logln("DOSF: minimo operativo " + String(DOSF_PCT_MIN) + "% aplicado (calibracion de campo)");
+  }
+  bool arrancando = (dosfPct == 0 && pct > 0);
+  dosfPct = pct;
+  dosfWrite(pctToDuty(dosfPct, 255));
+  if (arrancando) {
+    dosfStartMs = millis(); dosfPulsesAtStart = hallCount; hallLastPulseMs = millis();
+    // v8.3: patada de arranque al 100% para vencer la friccion estatica.
+    dosfWrite(255);
+    kickUntil = millis() + KICK_MS;
+    arranqueNextMs = millis() + KICK_MS + ARRANQUE_STEP_MS;
+  }
+  if (dosfPct == 0) kickUntil = 0;
+  ledMirror();
+  logln("DOSF=" + String(dosfPct) + "%");
+}
+void setTol(int pct) { tolPct = constrain(pct, 0, 100); ledcWrite(PIN_TOL, pctToDuty(tolPct, 255)); ledMirror(); logln("TOL=" + String(tolPct) + "%"); }
+
+// ---------------- EVENTOS PERSISTENTES (v8/P0-1) ----------------
+uint32_t evtLineSeq(const String& line) {
+  // "EVT,<seq>,..." -> seq
+  int c1 = line.indexOf(',');
+  int c2 = line.indexOf(',', c1 + 1);
+  if (c1 < 0 || c2 < 0) return 0;
+  return (uint32_t) line.substring(c1 + 1, c2).toInt();
+}
+void evtAppend(const String& line) {
+  File f = LittleFS.open(EVT_FILE, FILE_APPEND);
+  if (!f) { logln("!! EVT: no se pudo abrir el archivo de eventos"); return; }
+  f.println(line);
+  f.close();
+  // v9.6: respaldo en microSD si esta habilitado y la tarjeta esta presente
+  if (sdEnabled && sdOk) {
+    File s = SD.open("/eventos.csv", FILE_APPEND);
+    if (s) { s.println(line); s.close(); }
+    else { sdOk = false; logln("SD: fallo de escritura — reintenta con 'sd on'"); }
+  }
+}
+uint32_t evtCount() {
+  File f = LittleFS.open(EVT_FILE, FILE_READ);
+  if (!f) return 0;
+  uint32_t n = 0;
+  while (f.available()) { if (f.read() == '\n') n++; }
+  f.close();
+  return n;
+}
+void evtSince(uint32_t since) {
+  File f = LittleFS.open(EVT_FILE, FILE_READ);
+  if (!f) { out.println("EVT EMPTY"); return; }
+  uint32_t sent = 0;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    if (evtLineSeq(line) > since) { out.println(line); sent++; }
+  }
+  f.close();
+  out.printf("EVT END %lu\n", (unsigned long)sent);
+}
+void evtAck(uint32_t upTo) {
+  File src = LittleFS.open(EVT_FILE, FILE_READ);
+  if (!src) { out.println("EVT ACK 0"); return; }
+  File dst = LittleFS.open("/events.tmp", FILE_WRITE);
+  if (!dst) { src.close(); logln("!! EVT: no se pudo purgar"); return; }
+  uint32_t purged = 0;
+  while (src.available()) {
+    String line = src.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    if (evtLineSeq(line) <= upTo) purged++;
+    else dst.println(line);
+  }
+  src.close(); dst.close();
+  LittleFS.remove(EVT_FILE);
+  LittleFS.rename("/events.tmp", EVT_FILE);
+  out.printf("EVT ACK %lu (pendientes %lu)\n", (unsigned long)purged, (unsigned long)evtCount());
+}
+
+/**
+ * v8/P0-3: linea canonica del evento de dosificacion. Se emite por el canal
+ * activo Y se persiste en LittleFS (sobrevive reinicios y ausencia de app).
+ * EVT,<seq>,<ms>,<gramos>,<pulsos>,<fix>,<lat>,<lon>,<turb%>,<tini>,<tfin>,<retardo>,<resultado>
+ */
+void emitDoseEvent(uint32_t pulses, float grams, const char* resultado) {
+  evtSeq++;
+  prefs.begin("dosapalm", false); prefs.putULong("evtseq", evtSeq); prefs.end();
+  bool fix = gps.location.isValid();
+  double la = fix ? gps.location.lat() : (hasLastFix ? lastFixLat : 0.0);
+  double lo = fix ? gps.location.lng() : (hasLastFix ? lastFixLon : 0.0);
+  char line[170];
+  snprintf(line, sizeof(line), "EVT,%lu,%lu,%.0f,%lu,%d,%.6f,%.6f,%d,%d,%d,%d,%s",
+           (unsigned long)evtSeq, (unsigned long)millis(), grams, (unsigned long)pulses,
+           fix ? 1 : 0, la, lo, turbRealPct, tIniMs, tFinMs, retardoMs, resultado);
+  out.println(line);
+  evtAppend(String(line));
+}
+
+// ---------------- SECUENCIADOR POR TABLAS ----------------
+const Step SEQ_LEDS[] = { {A_LEDR,1,400},{A_LEDR,0,150},{A_LEDG,1,400},{A_LEDG,0,150},{A_LEDB,1,400},{A_LEDB,0,150},{A_LEDALL,1,500},{A_LEDALL,0,0},{A_END,0,0} };
+const Step SEQ_MOTORS[] = { {A_TOL,50,3000},{A_TOL,0,500},{A_DOSF,50,3000},{A_DOSF,0,500},{A_TURB,30,4000},{A_TURB,0,0},{A_END,0,0} };
+const Step SEQ_IDENT[] = { {A_DOSF,47,1000},{A_DOSF,0,1500},{A_TOL,47,1000},{A_TOL,0,0},{A_IDENTNOTE,0,0},{A_END,0,0} };
+const Step SEQ_ALL[] = { {A_LEDR,1,400},{A_LEDR,0,150},{A_LEDG,1,400},{A_LEDG,0,150},{A_LEDB,1,400},{A_LEDB,0,150},{A_LEDALL,1,500},{A_LEDALL,0,200},{A_LD,1,800},{A_LD,0,200},{A_AUX,1,800},{A_AUX,0,200},{A_TOL,50,3000},{A_TOL,0,500},{A_DOSF,50,3000},{A_DOSF,0,500},{A_TURB,30,4000},{A_TURB,0,500},{A_REPORT,0,0},{A_END,0,0} };
+const Step SEQ_CICLO[] = { {A_TURB,40,2500},{A_TOL,60,100},{A_DOSF,60,4000},{A_DOSF,0,100},{A_TOL,0,0},{A_TURB,40,3500},{A_TURB,0,0},{A_END,0,0} };
+
+Step dynSeq[48];
+
+const Step*  seqCur = nullptr;
+int          seqIdx = 0;
+uint32_t     seqT = 0;
+const char*  seqName = "";
+void reportInputs();
+
+void seqDo(const Step &s) {
+  switch (s.act) {
+    case A_LEDR: digitalWrite(PIN_LED_R, s.val); break;
+    case A_LEDG: digitalWrite(PIN_LED_G, s.val); break;
+    case A_LEDB: digitalWrite(PIN_LED_B, s.val); break;
+    case A_LEDALL: digitalWrite(PIN_LED_R,s.val); digitalWrite(PIN_LED_G,s.val); digitalWrite(PIN_LED_B,s.val); break;
+    case A_LD:   ldOn = s.val; digitalWrite(PIN_LD, s.val); break;
+    case A_AUX:  auxOn = s.val; digitalWrite(PIN_AUX, s.val); break;
+    case A_TURB: setTurb(s.val); break;
+    case A_DOSF: setDosf(s.val); break;
+    case A_TOL:  setTol(s.val); break;
+    case A_REPORT: reportInputs(); break;
+    case A_IDENTNOTE: logln("IDENT: anotar que motor giro; si esta cruzado corregir PIN_DOSF/PIN_TOL"); break;
+    default: break;
+  }
+}
+void seqAdvance() {
+  seqIdx++;
+  if (seqCur[seqIdx].act == A_END) {
+    if (turbPct || dosfPct || tolPct) { setTurb(0); setDosf(0); setTol(0); }
+    logln("SEQ " + String(seqName) + " completada");
+    seqCur = nullptr; return;
+  }
+  seqDo(seqCur[seqIdx]); seqT = millis();
+}
+void seqStart(const Step *s, const char *name) {
+  if (seqCur) logln("SEQ " + String(seqName) + " abortada por nueva secuencia");
+  seqCur = s; seqName = name; seqIdx = -1;
+  logln("SEQ " + String(name) + " inicio"); seqAdvance();
+}
+void seqUpdate() { if (!seqCur) return; if (millis() - seqT >= seqCur[seqIdx].dur) seqAdvance(); }
+
+// v8/P2-9: tolera tokens sin ':' sin producir basura.
+void seqRunFromString(String s) {
+  s.trim(); int idx = 0, from = 0;
+  while (from < (int)s.length() && idx < 47) {
+    int comma = s.indexOf(',', from);
+    String tok = (comma < 0) ? s.substring(from) : s.substring(from, comma);
+    tok.trim();
+    int colon = tok.indexOf(':');
+    if (tok.length() >= 3 && colon > 0) {
+      char m = tok.charAt(0);
+      int val = tok.substring(1, colon).toInt();
+      uint32_t dur = (uint32_t) tok.substring(colon + 1).toInt();
+      uint8_t act = (m=='T'||m=='t') ? A_TURB : (m=='D'||m=='d') ? A_DOSF : (m=='O'||m=='o') ? A_TOL : A_END;
+      if (act != A_END) { dynSeq[idx].act = act; dynSeq[idx].val = val; dynSeq[idx].dur = dur; idx++; }
+    }
+    if (comma < 0) break; from = comma + 1;
+  }
+  dynSeq[idx].act = A_END; dynSeq[idx].val = 0; dynSeq[idx].dur = 0;
+  if (idx == 0) { logln("seq run: formato invalido. Ej: T40:2500,D60:4000,T0:0"); return; }
+  seqStart(dynSeq, "CUSTOM");
+}
+
+// ---------------- SEGURIDAD ----------------
+void allSafe() {
+  seqCur = nullptr; dosState = DOS_IDLE; calActive = false; gpsRawUntil = 0;
+  turbOffAt = dosfOffAt = tolOffAt = 0;
+  turbDutyTarget = 0; turbDutyNow = 0; turbPct = 0;
+  ledcWrite(PIN_TURB, 0); setDosf(0); setTol(0);
+  digitalWrite(PIN_AUX, LOW); auxOn = false;
+  digitalWrite(PIN_LD, LOW);  ldOn = false;
+  digitalWrite(PIN_LED_R, LOW); digitalWrite(PIN_LED_G, LOW); digitalWrite(PIN_LED_B, LOW);
+  ledMirror();
+  logln("SAFE: todas las salidas apagadas, secuencias abortadas");
+}
+
+// ---------------- DOSIFICACION MODO REAL ----------------
+void dosificarStart() {
+  if (runMode != MODE_REAL) { logln("dosificar: cambia a 'modo real' primero"); return; }
+  // v9.3: una tarjeta SIN CONFIGURAR no dosifica (ni con el pulsador): primero
+  // hay que calibrar y enviarle la configuracion desde la app.
+  if (!cfgOk) { logln("DOSIFICAR BLOQUEADO: tarjeta SIN CONFIGURAR - envia la configuracion desde la app (vista Configuracion)"); return; }
+  // v10.2: SIN OPERACION ACTIVA NO HAY CICLOS. La operacion se activa
+  // sosteniendo el pulsador el tiempo configurado (o desde la app). Evita
+  // ciclos accidentales al manipular el boton.
+  if (!opActive) { logln("DOSIFICAR BLOQUEADO: sin OPERACION activa - manten el pulsador " + String(opHoldMs/1000) + " s o iniciala desde la app"); return; }
+  if (dosState != DOS_IDLE)  { logln("dosificar: ya hay una dosificacion en curso ('parar' para detener)"); return; }
+  // v9.1: anti-repeticion — sin nuevos ciclos hasta que pase el rearme.
+  if (rearmeMs > 0 && lastCycleEndMs != 0 && millis() - lastCycleEndMs < rearmeMs) {
+    logln("DOSIFICAR BLOQUEADO: anti-repeticion (" + String(millis() - lastCycleEndMs) +
+          " ms desde el ultimo ciclo; rearme " + String(rearmeMs) + " ms)");
+    return;
+  }
+  // v8/P1-4: redondeo al pulso mas cercano (v7 truncaba y entregaba de menos).
+  uint32_t pulses = (uint32_t) lroundf((float)dosisG / GRAMS_PER_PULSE);
+  dosStartPulses  = hallCount;
+  dosTargetPulses = hallCount + pulses;
+  // v8/P1-5: arranca el lazo desde el duty configurado. v8.8: con duty fijo,
+  // ctrlDutyF ES el duty constante (kick/arranque vuelven siempre a el).
+  ctrlDutyF = (float) pctToDuty(dutyFijoPct > 0 ? dutyFijoPct : dosfRealPct, 255);
+  ctrlPrevCount = hallCount;
+  ctrlPrevPulseMs = 0;
+  setTurb(turbRealPct);
+  dosState = DOS_WARMUP; dosT = millis();
+  logln("DOSIFICAR: dosis " + String(dosisG) + " g (" + String((unsigned long)pulses) + " pulsos, reales " + String(pulses * GRAMS_PER_PULSE, 0) + " g) | turbina " + String(turbRealPct) + "% | warmup " + String(tIniMs) + "ms");
+}
+void pararDosificacion() {
+  if (calActive) { calActive = false; logln("CALIBRAR: detenido"); }
+  else if (dosState != DOS_IDLE) {
+    uint32_t p = hallCount - dosStartPulses;
+    emitDoseEvent(p, p * GRAMS_PER_PULSE, "partial");   // v8/P0-3
+  }
+  dosState = DOS_IDLE; lastCycleEndMs = millis(); allSafe(); logln("PARAR: dosificacion detenida");
+}
+void dosService() {
+  switch (dosState) {
+    case DOS_WARMUP:
+      if (millis() - dosT >= (uint32_t)tIniMs) {
+        setTol(tolRealPct);
+        setDosf(dutyFijoPct > 0 ? dutyFijoPct : dosfRealPct);
+        dosState = DOS_DOSING; dosT = millis();
+        logln("DOSIFICAR: dosificando (retardo cav " + String(retardoMs) + "ms)..." +
+              (dutyFijoPct > 0 ? " | duty fijo " + String(dutyFijoPct) + "% (constante)" : ""));
+      }
+      break;
+    case DOS_DOSING:
+      if (hallCount >= dosTargetPulses) { setDosf(0); setTol(0); dosState = DOS_CLEAN; dosT = millis(); logln("DOSIFICAR: dosis alcanzada, limpieza turbina " + String(tFinMs) + "ms"); }
+      break;
+    case DOS_CLEAN:
+      if (millis() - dosT >= (uint32_t)tFinMs) {
+        setTurb(0); dosState = DOS_IDLE;
+        lastCycleEndMs = millis();   // v9.1: arranca la ventana de anti-repeticion
+        uint32_t p = hallCount - dosStartPulses;
+        String fin = "DOSIFICAR: completado. Total " + String(p * GRAMS_PER_PULSE, 0) + " g | rearme " + String(rearmeMs) + " ms";
+        logln(fin);
+        emitDoseEvent(p, p * GRAMS_PER_PULSE, "ok");    // v8/P0-3
+        // v9.7: REPETIR el cierre 700 ms despues — una sola notificacion BLE
+        // puede perderse y la app quedaria contando para siempre.
+        finRepetir = fin; finRepetirAt = millis() + 700;
+      }
+      break;
+    default: break;
+  }
+}
+
+/**
+ * v8/P1-5: lazo de control proporcional. En cada pulso hall mide el intervalo
+ * real y ajusta el duty del DOSIFICADOR para converger al retardo objetivo.
+ * Corre durante la dosificacion (retardoMs) y durante la calibracion
+ * (calRetardoMs, solo dosificador). retardo=0 desactiva el control.
+ */
+void retardoControlService() {
+  // v8.8: con duty fijo la dosificacion es a PWM CONSTANTE — no hay lazo. Lo
+  // unico que se hace es restaurar el duty fijo cuando la patada de arranque o
+  // la escalada lo dejaron distinto (una vez el motor ya dio su primer pulso).
+  if (dosState == DOS_DOSING && dutyFijoPct > 0) {
+    int fijo = pctToDuty(dutyFijoPct, 255);
+    if (hallCount != dosfPulsesAtStart && kickUntil == 0 && dosfAppliedDuty != fijo) {
+      ctrlDutyF = (float)fijo;
+      dosfWrite(fijo);
+    }
+    return;
+  }
+  int target = 0;
+  if (dosState == DOS_DOSING) target = retardoMs;
+  else if (calActive)         target = calRetardoMs;
+  if (target <= 0) return;
+  uint32_t count = hallCount;
+  if (count == ctrlPrevCount) return;               // sin pulso nuevo
+  uint32_t t = hallLastPulseMs;
+  if (ctrlPrevPulseMs > 0) {
+    int32_t interval = (int32_t)(t - ctrlPrevPulseMs);
+    // v8.6: si este intervalo quedo dentro del +/-15%% del objetivo, el duty que
+    // lo produjo (ANTES del ajuste) cuenta para el promedio calibrado.
+    if (calActive && abs(interval - (int32_t)target) * 100 <= 15 * target) {
+      calDutySum += ctrlDutyF;
+      calDutyN++;
+    }
+    int32_t error = interval - (int32_t)target;     // + = va lento -> subir duty
+    ctrlDutyF += KP_RETARDO * (float)error;
+    ctrlDutyF = constrain(ctrlDutyF, (float)DOSF_DUTY_MIN, 255.0f);
+    dosfWrite((int)ctrlDutyF);
+    // v8: reportar el duty aplicado en cada ajuste, para verlo en vivo en la app.
+    int pct = (int)((ctrlDutyF * 100.0f) / 255.0f + 0.5f);
+    logln("CTRL: duty " + String(pct) + "% (" + String((int)ctrlDutyF) + "/255) | intervalo " + String(interval) + " ms");
+  }
+  ctrlPrevCount = count;
+  ctrlPrevPulseMs = t;
+}
+
+/** v8.3: fin de la patada de arranque — volver al duty objetivo vigente. */
+void kickService() {
+  if (kickUntil == 0 || millis() < kickUntil) return;
+  kickUntil = 0;
+  if (dosfPct > 0) {
+    int duty = (dosState == DOS_DOSING || calActive) ? (int)ctrlDutyF : pctToDuty(dosfPct, 255);
+    dosfWrite(duty);
+  }
+}
+
+/**
+ * v8.3: arranque asistido. Si el dosificador esta encendido (dosis o
+ * calibracion) y el hall aun no reporta el PRIMER pulso, el duty sube por
+ * escalones hasta que el motor arranque — antes moria por "SENSOR HALL NO
+ * DETECTADO" sin intentar nada.
+ */
+void arranqueService() {
+  if (dosfPct == 0 || kickUntil) return;
+  if (dosState == DOS_IDLE && !calActive) return;      // solo dosis/calibracion
+  if (hallCount != dosfPulsesAtStart) return;          // ya arranco
+  if (millis() < arranqueNextMs) return;
+  arranqueNextMs = millis() + ARRANQUE_STEP_MS;
+  ctrlDutyF = min(255.0f, ctrlDutyF + ARRANQUE_STEP);
+  dosfWrite((int)ctrlDutyF);
+  int pct = (int)((ctrlDutyF * 100.0f) / 255.0f + 0.5f);
+  logln("CTRL: duty " + String(pct) + "% (" + String((int)ctrlDutyF) + "/255) | arranque");
+}
+
+/**
+ * v8: `calibrar <ms> [pulsos]` — mide la cadencia con el dosificador SOLO.
+ * `pulsos = 0` = MODO CONTINUO: gira indefinidamente a ese retardo (con el lazo
+ * activo) hasta recibir `parar`. Sirve para observar el duty en régimen.
+ */
+void calibrarStart(int ms, int pulses) {
+  if (dosState != DOS_IDLE) { logln("calibrar: hay una dosificacion en curso ('parar' primero)"); return; }
+  if (calActive)            { logln("calibrar: ya hay una calibracion en curso"); return; }
+  bool continuo = (pulses == 0);
+  if (!continuo && pulses < 2) pulses = 5;
+  calActive = true;
+  calRetardoMs = max(0, ms);
+  dosStartPulses = hallCount;
+  calTargetPulses = continuo ? 0 : hallCount + (uint32_t)pulses;   // 0 = sin fin
+  // v8.4: la calibracion SIEMPRE arranca al 90% — asi el motor parte con fuerza
+  // de sobra y el lazo converge BAJANDO hacia el duty real del retardo, durante
+  // el tiempo de calibracion que eligio el usuario.
+  ctrlDutyF = (float) pctToDuty(90, 255);
+  ctrlPrevCount = hallCount;
+  ctrlPrevPulseMs = 0;
+  calDutySum = 0; calDutyN = 0;   // v8.6
+  setDosf(90);            // SOLO el dosificador: turbina y tolva quedan apagadas
+  logln("CALIBRAR: retardo " + String(calRetardoMs) + " ms (" + (continuo ? String("continuo") : String(pulses) + " pulsos") + ") | solo dosificador");
+}
+void calService() {
+  if (!calActive) return;
+  if (calTargetPulses > 0 && hallCount >= calTargetPulses) {
+    setDosf(0);
+    calActive = false;
+    float dutyCal = calDutyN > 0 ? (calDutySum / (float)calDutyN) : ctrlDutyF;
+    int pct = (int)((dutyCal * 100.0f) / 255.0f + 0.5f);
+    logln("CALIBRAR: completado (" + String((unsigned long)(hallCount - dosStartPulses)) + " pulsos) | duty final " + String(pct) + "% (" + String((unsigned long)calDutyN) + " validas)");
+  }
+}
+
+// ---------------- SERIAL / NVS / MODO CONFIG ----------------
+void loadPrefs() {
+  prefs.begin("dosapalm", false);
+  devSerial = prefs.getString("serial", "");
+  if (devSerial.length() == 0) {
+    uint64_t mac = ESP.getEfuseMac(); char s[24];
+    sprintf(s, "DOSAPALM-%06X", (uint32_t)(mac >> 24) & 0xFFFFFF);
+    devSerial = String(s); prefs.putString("serial", devSerial);
+  }
+  connMode = (ConnMode) prefs.getUChar("conn", CONN_BLE);
+  monIntervalMs = prefs.getULong("monms", 5000);
+  evtSeq = prefs.getULong("evtseq", 0);   // v8/P0-1
+  hallTimeoutMs = prefs.getULong("atascoms", 4000);   // v8.3
+  dutyFijoPct = prefs.getInt("dutyfijo", 0);          // v8.8
+  rearmeMs = prefs.getULong("rearmems", 5000);        // v9.1
+  cfgOk = prefs.getBool("cfgok", false);              // v9.2
+  // v10.1: parametros de dosificacion PERSISTIDOS (comando `guardar`) — son
+  // los que usa el boton fisico tras un reinicio, sin app.
+  dosisG      = prefs.getInt("p_dosis", dosisG);
+  retardoMs   = prefs.getInt("p_ret", retardoMs);
+  tIniMs      = prefs.getInt("p_tini", tIniMs);
+  tFinMs      = prefs.getInt("p_tfin", tFinMs);
+  turbRealPct = prefs.getInt("p_turb", turbRealPct);
+  // v10.7: el equipo SIEMPRE enciende en modo normal, SIN operacion — la
+  // operacion se activa cada jornada (pulsador sostenido o app). Los datos de
+  // la sesion anterior quedan intactos en la memoria de eventos (LittleFS/SD).
+  opActive = false;
+  sdEnabled = prefs.getBool("sdon", false);           // v9.6
+  opHoldMs = prefs.getULong("holdop", 5000);          // v9.4
+  btHoldMs = prefs.getULong("holdbt", 3000);          // v9.4
+  btnMinMs = prefs.getULong("btnmin", 150);           // v10.3
+  freqTurb = prefs.getULong("fturb", 5000);           // v8.4
+  freqDosf = prefs.getULong("fdosf", 1000);
+  freqTol  = prefs.getULong("ftol", 1000);
+  prefs.end();
+}
+void saveConn(ConnMode m) { prefs.begin("dosapalm", false); prefs.putUChar("conn", (uint8_t)m); prefs.end(); }
+void saveSerial(String s) {
+  s.trim();
+  if (s.length() < 3 || s.length() > 20) { logln("Serial invalido (3-20 caracteres)"); return; }
+  prefs.begin("dosapalm", false); prefs.putString("serial", s); prefs.end();
+  devSerial = s; logln("Serial guardado: " + devSerial + " (nombre BLE/SSID se aplica tras reiniciar)");
+}
+void configToggle() {
+  configMode = !configMode;
+  if (configMode) { allSafe(); logln("== MODO CONFIGURACION/BLUETOOTH (pulsador 3s) =="); logln("Serial: " + devSerial); logln("Comandos: 'serial ver' | 'serial set <nuevo>' | 'conn <ble|wifi>' | 'salir'"); }
+  else { logln("== CONFIGURACION TERMINADA =="); ledMirror(); if (runMode != MODE_REAL) digitalWrite(PIN_LED_B, LOW); }
+}
+void configService() { if (!configMode) return; if (millis() - tCfgBlink >= 400) { tCfgBlink = millis(); digitalWrite(PIN_LED_B, !digitalRead(PIN_LED_B)); } }
+
+// ---------------- GPS ----------------
+void gpsService() {
+  bool raw = millis() < gpsRawUntil;
+  while (gpsSerial.available()) { char c = gpsSerial.read(); gps.encode(c); if (raw) out.write((uint8_t)c); }
+  // v8/P0-3: recordar el ultimo fix valido (para eventos bajo palma).
+  if (gps.location.isValid() && gps.location.isUpdated()) {
+    lastFixLat = gps.location.lat(); lastFixLon = gps.location.lng(); hasLastFix = true;
+  }
+}
+bool gpsRequireFix() { if (gps.location.isValid()) return true; out.printf("  Sin fix (sats: %d)\n", gps.satellites.value()); return false; }
+void gpsLoc()  { if (!gpsRequireFix()) return; out.printf("  %.6f, %.6f (alt %.1fm)\n", gps.location.lat(), gps.location.lng(), gps.altitude.meters()); }
+void gpsMaps() { if (!gpsRequireFix()) return; out.printf("  https://maps.google.com/?q=%.6f,%.6f\n", gps.location.lat(), gps.location.lng()); }
+void gpsSats() { out.printf("  Satelites: %d | HDOP: %.2f\n", gps.satellites.value(), gps.hdop.hdop()); }
+void gpsFixPrint() {
+  if (gps.location.isValid()) out.printf("  Fix: SI | Lat: %.6f | Lng: %.6f\n", gps.location.lat(), gps.location.lng());
+  else out.println("  Fix: NO (buscando)");
+  out.printf("  Sats: %d | HDOP: %.2f\n", gps.satellites.value(), gps.hdop.hdop());
+}
+
+// ---------------- STATUS / LOG ----------------
+void reportInputs() { logln("Pulsador: " + String(digitalRead(PIN_BTN)==LOW?"PRESIONADO":"libre")); logln("Hall: " + String(hallCount) + " pulsos | " + String(hallHz,1) + " Hz"); gpsFixPrint(); }
+void printStatus() {
+  out.println("---- STATUS ----");
+  out.printf("  Serial: %s | FW: v%s | Conn: %s%s\n", devSerial.c_str(), FW_VERSION, connMode==CONN_BLE?"BLE":"WiFi", configMode?"  [CONFIG]":"");
+  out.printf("  Modo: %s | Configurada: %s | Operacion: %s\n", runMode==MODE_NONE?"SIN SELECCIONAR":(runMode==MODE_TEST?"PRUEBA":"REAL"), cfgOk?"SI":"NO", opActive?"ACTIVA":"NO");
+  out.printf("  Pulsador: operacion %lu ms | bluetooth %lu ms | antirebote %lu ms\n", opHoldMs, btHoldMs, btnMinMs);
+  out.printf("  TURB: %d%% | DOSF: %d%% | TOL: %d%% | SEQ: %s\n", turbPct, dosfPct, tolPct, seqCur?seqName:"ninguna");
+  out.printf("  Dosif: dosis %dg, retardo %dms, tini %dms, tfin %dms, turbReal %d%%, dutyFijo %d%% | estado: %d\n", dosisG, retardoMs, tIniMs, tFinMs, turbRealPct, dutyFijoPct, (int)dosState);
+  out.printf("  PWM: turb %lu Hz | dosf %lu Hz | tol %lu Hz | atasco %lu ms | rearme %lu ms\n", freqTurb, freqDosf, freqTol, hallTimeoutMs, rearmeMs);
+  out.printf("  AUX: %s | LD: %s | LOG: %s | MON: %s cada %lums\n", auxOn?"ON":"off", ldOn?"ON":"off", logOn?"ON":"off", monOn?"ON":"off", monIntervalMs);
+  out.printf("  HALL: %lu pulsos, %.1f Hz, %.0f g | BTN: %s\n", hallCount, hallHz, hallCount*GRAMS_PER_PULSE, digitalRead(PIN_BTN)==LOW?"PRESIONADO":"libre");
+  out.printf("  EVT pendientes: %lu (seq %lu)\n", (unsigned long)evtCount(), (unsigned long)evtSeq);   // v8
+  out.printf("  BLE: %s | TCP: %s | WiFi estaciones: %d | IP: %s\n", bleConnected?"conectado":(bleActive?"anunciando":"off"), (tcpClient&&tcpClient.connected())?"conectado":"libre", WiFi.softAPgetStationNum(), wifiActive?WiFi.softAPIP().toString().c_str():"off");
+  out.printf("  Heap: %u | Uptime: %lus\n", ESP.getFreeHeap(), millis()/1000);
+}
+void printLogCSV() {
+  out.printf("LOG,%lu,%d,%d,%d,%lu,%.1f,%d,%d,%d,%.6f,%.6f,%.2f\n", millis(), turbPct, dosfPct, tolPct, hallCount, hallHz,
+             digitalRead(PIN_BTN)==LOW?1:0, gps.location.isValid()?1:0, gps.satellites.value(),
+             gps.location.isValid()?gps.location.lat():0.0, gps.location.isValid()?gps.location.lng():0.0, gps.hdop.hdop());
+}
+void printHelp() {
+  out.println(F(
+    "Comandos:\n"
+    "  status | safe | reset | help | red\n"
+    "  clave <codigo> -> autoriza el canal (BLE/TCP/WS lo exigen)\n"
+    "  conn <ble|wifi> -> elige UNA conexion inalambrica (guarda y reinicia)\n"
+    "  modo <prueba|real>\n"
+    "  [PRUEBA] led <r|g|b|all> <on|off> | led seq | turb/dosf/tol <0-100> [ms]\n"
+    "           aux <on|off> | ld <on|off> | test <leds|motors|all> | ident\n"
+    "  [REAL]   turb <0-100> (velocidad) | dosis <g> | retardo <ms> | tini <ms> | tfin <ms>\n"
+    "           dosificar -> inicia | parar -> detiene\n"
+    "           retardo = intervalo objetivo entre pulsos hall (0 = sin control)\n"
+    "  calibrar <ms> [pulsos] -> mide la cadencia SOLO con el dosificador\n"
+    "  calibrar <ms> 0        -> continuo a ese retardo (apagar con 'parar')\n"
+    "  atasco <ms>            -> timeout del guardian de atasco (persistente)\n"
+    "  freq <turb|dosf|tol> <hz> -> frecuencia PWM del motor (persistente)\n"
+    "  dutyfijo <pct|0> -> PWM CONSTANTE del dosificador al dosificar (0 = lazo)\n"
+    "  rearme <ms|0> -> bloqueo anti-repeticion tras cada ciclo (0 = sin bloqueo)\n"
+    "  guardar -> persiste dosis/turbina/tiempos/retardo (config del boton fisico)\n"
+    "  operacion <on|off> -> estado de toma de datos (LED rojo titila 300 ms)\n"
+    "  hold <op|bt> <ms> -> duracion de pulsacion sostenida (operacion/bluetooth)\n"
+    "  rebote <30-1000> -> presion minima del pulsador (antirebote, persistente)\n"
+    "  evt count | evt since <seq> | evt ack <seq>  -> eventos persistidos\n"
+    "  ciclo                       -> ciclo por defecto (3 etapas)\n"
+    "  seq run T40:2500,D60:4000,T0:0   -> secuencia configurable (T=turb,D=dosf,O=tol)\n"
+    "  mon on|off | mon set <seg> | mon vars <turb,dosf,tol,hall,btn,gps,ble,seq>\n"
+    "  log <on|off> | hall [reset] | btn | gps [loc|maps|sats|raw <seg>]\n"
+    "  serial ver | serial set <nuevo> | config | salir"));
+}
+void printRed() {
+  out.println("---- CONEXIONES ----");
+  out.printf("  Serial/BLE/SSID: %s | Conn activa: %s\n", devSerial.c_str(), connMode==CONN_BLE?"BLE":"WiFi");
+  if (connMode==CONN_BLE) out.printf("  BLE UART '%s' (%s)\n", devSerial.c_str(), bleConnected?"conectado":"anunciando");
+  else { out.printf("  WiFi AP '%s' pass '%s' canal %d | WS ws://%s:%u/ | TCP %s:%u (clave %s)\n", devSerial.c_str(), WIFI_AP_PASS, WIFI_CHAN, WiFi.softAPIP().toString().c_str(), WS_PORT, WiFi.softAPIP().toString().c_str(), TCP_PORT, ACCESS_KEY); }
+}
+
+// ---------------- MON configurable ----------------
+void monSetVars(String csv) {
+  csv.toLowerCase();
+  monV_turb = csv.indexOf("turb")>=0; monV_dosf = csv.indexOf("dosf")>=0; monV_tol = csv.indexOf("tol")>=0;
+  monV_hall = csv.indexOf("hall")>=0; monV_btn = csv.indexOf("btn")>=0; monV_gps = csv.indexOf("gps")>=0;
+  monV_ble = csv.indexOf("ble")>=0 || csv.indexOf("bt")>=0; monV_seq = csv.indexOf("seq")>=0;
+  logln("MON variables actualizadas");
+}
+void monService() {
+  if (!monOn || millis() - tMon < monIntervalMs) return;
+  tMon = millis();
+  if (runMode == MODE_NONE) { out.println(">> Esperando modo: 'modo prueba' o 'modo real'"); return; }
+  String s = "[MON] modo=";
+  s += configMode ? "CONFIG" : (runMode==MODE_TEST ? "PRUEBA" : "REAL");
+  if (monV_turb) s += " | TURB " + String(turbPct) + "%";
+  if (monV_dosf) s += " | DOSF " + String(dosfPct) + "%";
+  if (monV_tol)  s += " | TOL " + String(tolPct) + "%";
+  if (monV_hall) { char b[48]; sprintf(b, " | hall %lu (%.1f Hz, %.0f g)", hallCount, hallHz, hallCount*GRAMS_PER_PULSE); s += b; }
+  if (monV_btn)  s += " | btn " + String(digitalRead(PIN_BTN)==LOW?"PRES":"libre");
+  if (monV_gps)  s += " | GPS " + String(gps.location.isValid()?"FIX":"sin-fix") + " sats=" + String(gps.satellites.value());
+  if (monV_ble)  s += String(" | BT ") + (bleConnected?"ON":"-") + " | TCP " + ((tcpClient&&tcpClient.connected())?"ON":"-");
+  if (monV_seq)  s += String(" | seq=") + (seqCur?seqName:"-");
+  out.println(s);
+}
+
+// ---------------- PARSER ----------------
+bool modeOk() {
+  if (configMode) { logln("Motores bloqueados en config ('salir' para volver)"); return false; }
+  if (runMode != MODE_NONE) return true;
+  logln("Primero selecciona el modo: 'modo prueba' o 'modo real'"); return false;
+}
+void handleCommand(String cmd, int ch) {
+  String raw = cmd; raw.trim(); cmd.trim(); cmd.toLowerCase();
+  if (cmd.length() == 0) return;
+  String t[4]; int n = 0, from = 0;
+  while (n < 4) { int sp = cmd.indexOf(' ', from); if (sp < 0) { t[n++] = cmd.substring(from); break; } t[n++] = cmd.substring(from, sp); from = sp + 1; }
+
+  if (!authed[ch]) {
+    if (t[0] == "clave" && t[1] == ACCESS_KEY) { authed[ch] = true; logln(String("[") + chName[ch] + "] ACCESO CONCEDIDO"); }
+    else out.printf("[%s] Acceso restringido. Envia: clave <codigo>\n", chName[ch]);
+    return;
+  }
+  if (t[0] == "clave") { logln(String("[") + chName[ch] + "] canal ya autorizado"); return; }
+
+  if      (t[0] == "help")   printHelp();
+  else if (t[0] == "version") out.printf("VERSION %s\n", FW_VERSION);
+  else if (t[0] == "status") printStatus();
+  else if (t[0] == "red")    printRed();
+  else if (t[0] == "safe")   allSafe();
+  else if (t[0] == "reset")  { allSafe(); logln("== REINICIANDO EQUIPO (reset firmware)... =="); delay(300); ESP.restart(); }
+
+  else if (t[0] == "conn") {
+    if (t[1] == "ble" || t[1] == "wifi") { ConnMode m = (t[1]=="wifi")?CONN_WIFI:CONN_BLE; saveConn(m); logln("Conexion = " + t[1] + ". Reiniciando para aplicar..."); delay(300); ESP.restart(); }
+    else logln("Uso: conn ble | conn wifi (conexion actual: " + String(connMode==CONN_BLE?"ble":"wifi") + ")");
+  }
+
+  else if (t[0] == "modo") {
+    if (t[1] == "prueba") { runMode = MODE_TEST; allSafe(); logln("MODO PRUEBA activo: LEDs espejan motores. Comandos libres"); }
+    else if (t[1] == "real") { runMode = MODE_REAL; allSafe(); digitalWrite(PIN_LED_R, HIGH); logln("MODO REAL activo: rojo=power, verde=pulso hall 100ms, azul=BLE. Usa 'dosificar'/'parar'"); }
+    else logln("Uso: modo prueba | modo real");
+  }
+  else if (t[0] == "serial") {
+    if (t[1] == "set") { int p1 = raw.indexOf(' '); int p2 = raw.indexOf(' ', p1+1); if (p2>0) saveSerial(raw.substring(p2+1)); else logln("Uso: serial set <nuevo>"); }
+    else logln("Serial: " + devSerial);
+  }
+  else if (t[0] == "config") configToggle();
+  else if (t[0] == "salir")  { if (configMode) configToggle(); else logln("No estas en config"); }
+
+  else if (t[0] == "mon") {
+    if (t[1] == "set")  { int seg = t[2].toInt(); if (seg < 1) seg = 1; monIntervalMs = (uint32_t)seg*1000; prefs.begin("dosapalm", false); prefs.putULong("monms", monIntervalMs); prefs.end(); logln("MON intervalo = " + String(seg) + "s"); }
+    else if (t[1] == "vars") { int p = raw.indexOf("vars"); monSetVars(raw.substring(p+4)); }
+    else { monOn = (t[1] != "off"); tMon = millis(); logln("MON: " + String(monOn?"ON":"OFF") + " cada " + String(monIntervalMs/1000) + "s"); }
+  }
+
+  // v8/P0-1: eventos persistidos
+  else if (t[0] == "evt") {
+    if (t[1] == "count")      out.printf("EVT COUNT %lu\n", (unsigned long)evtCount());
+    else if (t[1] == "since") evtSince((uint32_t) t[2].toInt());
+    else if (t[1] == "ack")   evtAck((uint32_t) t[2].toInt());
+    else logln("Uso: evt count | evt since <seq> | evt ack <seq>");
+  }
+
+  // --- MODO PRUEBA: control libre ---
+  else if (t[0] == "led") {
+    if (t[1] == "seq") { seqStart(SEQ_LEDS, "LEDS"); return; }
+    int v = (t[2] == "on") ? HIGH : LOW;
+    if (t[1]=="r"||t[1]=="all") digitalWrite(PIN_LED_R, v);
+    if (t[1]=="g"||t[1]=="all") digitalWrite(PIN_LED_G, v);
+    if (t[1]=="b"||t[1]=="all") digitalWrite(PIN_LED_B, v);
+    logln("LED " + t[1] + " " + t[2]);
+  }
+  else if (t[0] == "turb") {
+    if (!modeOk()) return;
+    int p = (t[1] == "off") ? 0 : t[1].toInt();
+    if (runMode == MODE_REAL) { turbRealPct = constrain(p,0,100); logln("Velocidad turbina (real) = " + String(turbRealPct) + "%"); if (dosState!=DOS_IDLE) setTurb(turbRealPct); }
+    else { setTurb(p); turbOffAt = (p>0 && t[2].toInt()>0) ? millis()+t[2].toInt() : 0; }
+  }
+  else if (t[0] == "dosf") { if (!modeOk()) return; int p=(t[1]=="on")?100:((t[1]=="off")?0:t[1].toInt()); setDosf(p); dosfOffAt=(p>0&&t[2].toInt()>0)?millis()+t[2].toInt():0; }
+  else if (t[0] == "tol")  { if (!modeOk()) return; int p=(t[1]=="on")?100:((t[1]=="off")?0:t[1].toInt()); setTol(p);  tolOffAt =(p>0&&t[2].toInt()>0)?millis()+t[2].toInt():0; }
+  else if (t[0] == "aux")  { auxOn=(t[1]=="on"); digitalWrite(PIN_AUX,auxOn); logln("AUX "+t[1]); }
+  else if (t[0] == "ld")   { ldOn=(t[1]=="on");  digitalWrite(PIN_LD,ldOn);   logln("LD "+t[1]); }
+  else if (t[0] == "ident"){ if (!modeOk()) return; seqStart(SEQ_IDENT, "IDENT"); }
+  else if (t[0] == "test") { if (!modeOk()) return; if (t[1]=="leds") seqStart(SEQ_LEDS,"LEDS"); else if (t[1]=="motors") seqStart(SEQ_MOTORS,"MOTORS"); else seqStart(SEQ_ALL,"ALL"); }
+
+  // --- MODO REAL: dosificacion ---
+  else if (t[0] == "dosis")   { dosisG = max(0, (int)t[1].toInt()); logln("Dosis deseada = " + String(dosisG) + " g"); }
+  else if (t[0] == "retardo") { retardoMs = max(0, (int)t[1].toInt()); logln("Retardo cavidades = " + String(retardoMs) + " ms"); }
+  else if (t[0] == "freq") {
+    // v8.4: frecuencia PWM por motor, en caliente y persistente.
+    uint32_t hz = (uint32_t) t[2].toInt();
+    if (hz < 100 || hz > 40000) logln("Uso: freq <turb|dosf|tol> <100-40000> Hz");
+    else if (t[1] == "turb") { freqTurb = hz; ledcChangeFrequency(PIN_TURB, hz, RES_TURB); prefs.begin("dosapalm", false); prefs.putULong("fturb", hz); prefs.end(); logln("Frecuencia TURB = " + String(hz) + " Hz"); }
+    else if (t[1] == "dosf") { freqDosf = hz; ledcChangeFrequency(PIN_DOSF, hz, RES_MOT);  prefs.begin("dosapalm", false); prefs.putULong("fdosf", hz); prefs.end(); logln("Frecuencia DOSF = " + String(hz) + " Hz"); }
+    else if (t[1] == "tol")  { freqTol  = hz; ledcChangeFrequency(PIN_TOL, hz, RES_MOT);   prefs.begin("dosapalm", false); prefs.putULong("ftol", hz); prefs.end(); logln("Frecuencia TOL = " + String(hz) + " Hz"); }
+    else logln("Uso: freq <turb|dosf|tol> <hz>");
+  }
+  else if (t[0] == "dutyfijo") {
+    // v8.8: PWM constante para la dosificacion (viene de la calibracion).
+    int p = (int)t[1].toInt();
+    if (p <= 0) {
+      dutyFijoPct = 0;
+      prefs.begin("dosapalm", false); prefs.putInt("dutyfijo", 0); prefs.end();
+      logln("Duty fijo: desactivado (lazo de control)");
+    } else {
+      dutyFijoPct = constrain(p, DOSF_PCT_MIN, 100);
+      prefs.begin("dosapalm", false); prefs.putInt("dutyfijo", dutyFijoPct); prefs.end();
+      logln("Duty fijo dosificacion = " + String(dutyFijoPct) + "% (constante, sin lazo)");
+    }
+  }
+  else if (t[0] == "rebote") {
+    // v10.3: presion minima del pulsador (antirebote/antirruido, persistente)
+    uint32_t ms = (uint32_t) t[1].toInt();
+    if (t[1].length() == 0) logln("Antirebote del pulsador = " + String(btnMinMs) + " ms");
+    else if (ms >= 30 && ms <= 1000) {
+      btnMinMs = ms;
+      prefs.begin("dosapalm", false); prefs.putULong("btnmin", btnMinMs); prefs.end();
+      logln("Antirebote del pulsador = " + String(btnMinMs) + " ms");
+    } else logln("Uso: rebote <30-1000> ms (actual " + String(btnMinMs) + ")");
+  }
+  else if (t[0] == "guardar") {
+    // v10.1: persistir la configuracion de dosificacion vigente en NVS — es la
+    // que usa el boton fisico en cualquier ciclo, incluso tras reiniciar.
+    prefs.begin("dosapalm", false);
+    prefs.putInt("p_dosis", dosisG);
+    prefs.putInt("p_ret", retardoMs);
+    prefs.putInt("p_tini", tIniMs);
+    prefs.putInt("p_tfin", tFinMs);
+    prefs.putInt("p_turb", turbRealPct);
+    prefs.end();
+    logln("CONFIG GUARDADA: dosis " + String(dosisG) + " g | turbina " + String(turbRealPct) +
+          "% | tini " + String(tIniMs) + " ms | tfin " + String(tFinMs) + " ms | retardo " + String(retardoMs) +
+          " ms | dutyfijo " + String(dutyFijoPct) + "% (persistente para el boton fisico)");
+  }
+  else if (t[0] == "sd") {
+    // v9.6: respaldo de eventos en microSD (persistente)
+    if (t[1] == "on") {
+      sdEnabled = true;
+      prefs.begin("dosapalm", false); prefs.putBool("sdon", true); prefs.end();
+      logln("SD: respaldo activado");
+      sdMount();
+    } else if (t[1] == "off") {
+      sdEnabled = false;
+      prefs.begin("dosapalm", false); prefs.putBool("sdon", false); prefs.end();
+      logln("SD: respaldo desactivado");
+    } else {
+      logln(String("SD: ") + (sdEnabled ? (sdOk ? "respaldo activado (montada)" : "respaldo activado (SIN tarjeta)") : "respaldo desactivado"));
+    }
+  }
+  else if (t[0] == "operacion") {
+    // v9.4: estado constante de operacion (toma de datos, LED rojo titilando)
+    if (t[1] == "on") setOperacion(true);
+    else if (t[1] == "off") setOperacion(false);
+    else logln(String("OPERACION: ") + (opActive ? "ACTIVA" : "DETENIDA"));
+  }
+  else if (t[0] == "hold") {
+    // v9.4: duracion de las pulsaciones sostenidas (persistentes)
+    uint32_t ms = (uint32_t) t[2].toInt();
+    if (t[1] == "op" && ms >= 1000) { opHoldMs = ms; prefs.begin("dosapalm", false); prefs.putULong("holdop", ms); prefs.end(); logln("Pulsacion para OPERACION = " + String(ms) + " ms"); }
+    else if (t[1] == "bt" && ms >= 1000) { btHoldMs = ms; prefs.begin("dosapalm", false); prefs.putULong("holdbt", ms); prefs.end(); logln("Pulsacion para BLUETOOTH = " + String(ms) + " ms"); }
+    else logln("Uso: hold op <ms> | hold bt <ms> (min 1000; actual op " + String(opHoldMs) + " / bt " + String(btHoldMs) + ")");
+    if (btHoldMs >= opHoldMs) logln("AVISO: la pulsacion de bluetooth (" + String(btHoldMs) + " ms) deberia ser MENOR que la de operacion (" + String(opHoldMs) + " ms)");
+  }
+  else if (t[0] == "configurado") {
+    // v9.2: bandera de configuracion aplicada (persistente)
+    if (t[1] == "ok") {
+      cfgOk = true;
+      prefs.begin("dosapalm", false); prefs.putBool("cfgok", true); prefs.end();
+      logln("CONFIGURADO: SI (marcado por la app)");
+    } else if (t[1] == "reset") {
+      cfgOk = false;
+      prefs.begin("dosapalm", false); prefs.putBool("cfgok", false); prefs.end();
+      logln("CONFIGURADO: NO (bandera borrada)");
+    } else {
+      logln(String("CONFIGURADO: ") + (cfgOk ? "SI" : "NO"));
+    }
+  }
+  else if (t[0] == "rearme") {
+    // v9.1: ventana anti-repeticion tras cada ciclo (persistente; 0 = sin bloqueo)
+    int ms = (int)t[1].toInt();
+    if (t[1].length() == 0) logln("Rearme anti-repeticion = " + String(rearmeMs) + " ms");
+    else {
+      rearmeMs = (uint32_t)max(0, ms);
+      prefs.begin("dosapalm", false); prefs.putULong("rearmems", rearmeMs); prefs.end();
+      logln("Rearme anti-repeticion = " + String(rearmeMs) + " ms" + (rearmeMs==0?" (DESACTIVADO)":""));
+    }
+  }
+  else if (t[0] == "atasco")  {
+    int ms = (int)t[1].toInt();
+    if (ms < 500) logln("Uso: atasco <ms> (minimo 500). Actual: " + String(hallTimeoutMs) + " ms");
+    else {
+      hallTimeoutMs = (uint32_t)ms;
+      prefs.begin("dosapalm", false); prefs.putULong("atascoms", hallTimeoutMs); prefs.end();
+      logln("Tiempo de atasco = " + String(hallTimeoutMs) + " ms");
+    }
+  }
+  else if (t[0] == "tini")    { tIniMs = max(0, (int)t[1].toInt()); logln("Tiempo inicial turbina = " + String(tIniMs) + " ms"); }
+  else if (t[0] == "tfin")    { tFinMs = max(0, (int)t[1].toInt()); logln("Tiempo final turbina = " + String(tFinMs) + " ms"); }
+  else if (t[0] == "dosificar") { if (!modeOk()) return; dosificarStart(); }
+  else if (t[0] == "calibrar")  { if (!modeOk()) return; calibrarStart((int)t[1].toInt(), t[2].length()?(int)t[2].toInt():5); }
+  else if (t[0] == "parar")     { pararDosificacion(); }
+
+  // --- Ciclos/secuencias ---
+  else if (t[0] == "ciclo") { if (!modeOk()) return; seqStart(SEQ_CICLO, "CICLO"); }
+  else if (t[0] == "seq")   { if (t[1] == "run") { if (!modeOk()) return; int p = raw.indexOf("run"); seqRunFromString(raw.substring(p+3)); } else logln("Uso: seq run T40:2500,D60:4000,T0:0"); }
+
+  else if (t[0] == "btn")  { logln("Pulsador: " + String(digitalRead(PIN_BTN)==LOW?"PRESIONADO":"libre")); }
+  else if (t[0] == "hall") {
+    if (t[1]=="reset") {
+      // v8/P1-7: durante una dosificacion el objetivo es absoluto; resetear el
+      // contador la volveria inalcanzable (sobredosis hasta el guardian).
+      if (dosState != DOS_IDLE) logln("hall reset: RECHAZADO durante una dosificacion ('parar' primero)");
+      else { hallCount=0; logln("Hall reseteado"); }
+    } else logln("Hall: " + String(hallCount) + " pulsos | " + String(hallCount*GRAMS_PER_PULSE,0) + " g");
+  }
+  else if (t[0] == "gps")  { if (t[1]=="raw") { int seg=t[2].length()?t[2].toInt():5; gpsRawUntil=millis()+(uint32_t)seg*1000; logln("GPS RAW "+String(seg)+"s"); } else if (t[1]=="loc") gpsLoc(); else if (t[1]=="maps") gpsMaps(); else if (t[1]=="sats") gpsSats(); else gpsFixPrint(); }
+  else if (t[0] == "log")  { logOn=(t[1]=="on"); if (logOn) out.println("LOG,ms,turb,dosf,tol,hall_cnt,hall_hz,btn,fix,sats,lat,lng,hdop"); logln("LOG "+t[1]); }
+
+  else logln("Comando desconocido. Escribe 'help'.");
+}
+
+// ---------------- BLE ----------------
+class ServerCB : public BLEServerCallbacks {
+  void onConnect(BLEServer* s) override { bleConnected = true; }
+  void onDisconnect(BLEServer* s) override {
+    bleConnected = false;
+    authed[CH_BT] = false;   // v8/P1-6: cada conexion BLE debe autorizarse de nuevo
+    s->getAdvertising()->start();
+  }
+};
+class RxCB : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* c) override {
+    String v = c->getValue();
+    for (int i = 0; i < (int)v.length(); i++) { uint16_t nh = (bleHead + 1) % sizeof(bleRing); if (nh != bleTail) { bleRing[bleHead] = v[i]; bleHead = nh; } }
+  }
+};
+void bleNotifyLine(const char* s, size_t n) {
+  if (!bleConnected || pTxChar == nullptr) return;
+  const size_t CH = 180;
+  for (size_t i = 0; i < n; i += CH) { size_t k = (n-i<CH)?(n-i):CH; pTxChar->setValue((uint8_t*)(s+i), k); pTxChar->notify(); }
+  uint8_t nl = '\n'; pTxChar->setValue(&nl, 1); pTxChar->notify();
+}
+void bleSetup() {
+  BLEDevice::init(devSerial.c_str());
+  BLEDevice::setMTU(185);
+  BLEServer* pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCB());
+  BLEService* pSvc = pServer->createService(NUS_SERVICE_UUID);
+  pTxChar = pSvc->createCharacteristic(NUS_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  pTxChar->addDescriptor(new BLE2902());
+  BLECharacteristic* pRx = pSvc->createCharacteristic(NUS_RX_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  pRx->setCallbacks(new RxCB());
+  pSvc->start();
+  BLEAdvertising* pAdv = BLEDevice::getAdvertising();
+  pAdv->addServiceUUID(NUS_SERVICE_UUID); pAdv->setScanResponse(true); pAdv->setMinPreferred(0x06); pAdv->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+  bleActive = true;
+}
+void feedBleByte(char c) {
+  int ch = CH_BT;
+  if (c=='\n'||c=='\r') { if (lens[ch]>0) { bufs[ch][lens[ch]]='\0'; handleCommand(String(bufs[ch]), ch); lens[ch]=0; } }
+  else if (lens[ch] < 79) bufs[ch][lens[ch]++] = c;
+  else lens[ch] = 0;
+}
+void drainBle() { while (bleTail != bleHead) { char c = bleRing[bleTail]; bleTail = (bleTail+1) % sizeof(bleRing); feedBleByte(c); } }
+
+// ---------------- I/O ----------------
+void feedChannel(int ch, Stream &s) {
+  while (s.available()) {
+    char c = s.read();
+    if (c=='\n'||c=='\r') { if (lens[ch]>0) { bufs[ch][lens[ch]]='\0'; handleCommand(String(bufs[ch]), ch); lens[ch]=0; } }
+    else if (lens[ch] < 79) bufs[ch][lens[ch]++] = c;
+    else { lens[ch]=0; out.println("Comando largo, descartado"); }
+  }
+}
+void ioService() {
+  feedChannel(CH_USB, Serial);
+  if (wifiActive && tcpClient && tcpClient.connected()) feedChannel(CH_TCP, tcpClient);
+  if (bleActive) drainBle();
+}
+void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t len) {
+  switch (type) {
+    case WStype_CONNECTED:
+      // v8/P1-6: el WS ya no entra autorizado.
+      authed[CH_WS] = false;
+      wsServer.sendTXT(num, "DOSAPALM WebSocket. Envia: clave <codigo>\n");
+      logln("EVENTO: cliente WebSocket conectado");
+      break;
+    case WStype_DISCONNECTED:
+      authed[CH_WS] = false;
+      logln("EVENTO: cliente WebSocket desconectado");
+      break;
+    case WStype_TEXT: { String cmd = ""; for (size_t i=0;i<len;i++) cmd += (char)payload[i]; cmd.trim(); if (cmd.length()) handleCommand(cmd, CH_WS); break; }
+    default: break;
+  }
+}
+
+// ---------------- SERVICIOS ----------------
+void hallService() { if (millis()-hallWindowStart >= 1000) { hallHz = (hallCount-hallCountWindow)*1000.0/(millis()-hallWindowStart); hallCountWindow=hallCount; hallWindowStart=millis(); } }
+void stallService() {
+  if (!dosfStallGuard || dosfPct == 0) return;
+  // v8.3: el guardian usa el timeout CONFIGURABLE ('atasco <ms>') y ademas
+  // escala con el retardo objetivo (500 ms/cavidad no es atasco).
+  int guardTarget = calActive ? calRetardoMs : retardoMs;
+  uint32_t sensorMs = max(hallTimeoutMs, (uint32_t)guardTarget * 4);
+  uint32_t jamMs    = max(hallTimeoutMs, (uint32_t)guardTarget * 4);
+  bool huboPulsos = (hallCount != dosfPulsesAtStart);
+  bool enDosis = (dosState != DOS_IDLE);
+  // v9.5: cualquier atasco/fallo de hall durante la dosificacion dispara SAFE
+  // COMPLETO — turbina, dosificador, tolva y secuencias, todo apagado.
+  if (!huboPulsos && (millis()-dosfStartMs > sensorMs)) {
+    if (enDosis) { uint32_t p = hallCount - dosStartPulses; emitDoseEvent(p, p*GRAMS_PER_PULSE, "error"); dosState=DOS_IDLE; lastCycleEndMs = millis(); }
+    allSafe();
+    logln("!! SENSOR HALL NO DETECTADO -> SAFE: todos los motores apagados. Revisar sensor/iman");
+  }
+  else if (huboPulsos && (millis()-hallLastPulseMs > jamMs)) {
+    if (enDosis) { uint32_t p = hallCount - dosStartPulses; emitDoseEvent(p, p*GRAMS_PER_PULSE, "error"); dosState=DOS_IDLE; lastCycleEndMs = millis(); }
+    allSafe();
+    logln("!! ATASCO: hall callo -> SAFE: todos los motores apagados. Revisar pinon/granulos");
+  }
+}
+void bootLedService() { if (!bootLedDone && millis() >= 500) { bootLedDone = true; digitalWrite(PIN_LED_R, HIGH); logln("LED POWER (rojo) ON @ 500ms"); } }
+void timerService() {
+  uint32_t now = millis();
+  if (turbOffAt && now>=turbOffAt) { turbOffAt=0; setTurb(0); logln("TIMER: TURB apagada"); }
+  if (dosfOffAt && now>=dosfOffAt) { dosfOffAt=0; setDosf(0); logln("TIMER: DOSF apagado"); }
+  if (tolOffAt  && now>=tolOffAt)  { tolOffAt=0;  setTol(0);  logln("TIMER: TOL apagada"); }
+}
+void eventService() {
+  static int prevBtn = HIGH; static uint32_t tBtn = 0, tPress = 0;
+  static bool holdConsumed = false;      // v9.9: la pulsacion larga YA ejecuto su accion
+  static uint32_t btnIgnoreUntil = 0;    // v9.9: bloqueo anti-rebote tras accion sostenida
+  int b = digitalRead(PIN_BTN);
+  // v9.9: la OPERACION dispara AL CUMPLIRSE el tiempo, SIN soltar — el LED
+  // rojo confirma en el acto. Esa pulsacion queda CONSUMIDA: al soltar no pasa
+  // nada mas, y el siguiente ciclo exige una NUEVA presion del boton.
+  if (b == LOW && tPress > 0 && !holdConsumed && millis() - tPress >= opHoldMs) {
+    holdConsumed = true;
+    logln("EVENTO: pulsador sostenido " + String(opHoldMs) + " ms -> OPERACION (suelta el boton)");
+    setOperacion(!opActive);
+  }
+  if (b != prevBtn && millis()-tBtn > 50) {
+    tBtn = millis(); prevBtn = b;
+    if (b == LOW) {
+      if (millis() < btnIgnoreUntil) { tPress = 0; logln("EVENTO: pulso ignorado (rebote tras accion sostenida)"); }
+      else { tPress = millis(); logln("EVENTO: pulsador PRESIONADO"); }
+    }
+    else if (tPress > 0) {
+      uint32_t dur = millis()-tPress;
+      logln("EVENTO: pulsador liberado (" + String(dur) + " ms)");
+      if (holdConsumed) {
+        // la accion sostenida ya se ejecuto: soltar NO dosifica, y el rebote
+        // mecanico del boton no puede colar un ciclo.
+        btnIgnoreUntil = millis() + 1200;
+        logln("EVENTO: accion sostenida completada — el proximo ciclo requiere una nueva presion");
+      }
+      // v9.1: presion minima real — los pulsos de ruido son mas cortos que
+      // una pulsacion humana y se descartan.
+      else if (dur < btnMinMs) { logln("EVENTO: pulso descartado (<" + String(btnMinMs) + " ms, posible ruido)"); }
+      else if (dur >= btHoldMs) { logln("EVENTO: pulsador sostenido " + String(dur) + " ms -> bluetooth/config"); configToggle(); }
+      else if (runMode == MODE_REAL && !configMode && dosState == DOS_IDLE) dosificarStart();
+      holdConsumed = false; tPress = 0;
+    }
+  }
+
+  static uint32_t hallPrinted = 0;
+  if (hallPrinted > hallCount) hallPrinted = hallCount;
+  while (hallPrinted < hallCount) {
+    hallPrinted++;
+    logln("EVENTO: hall pulso #" + String(hallPrinted) + " (+" + String(GRAMS_PER_PULSE,0) + " g, total " + String(hallPrinted*GRAMS_PER_PULSE,0) + " g)");
+    if (runMode == MODE_REAL) greenPulseUntil = millis() + 100;
+  }
+  static bool prevFix = false; bool fix = gps.location.isValid();
+  if (fix != prevFix) { prevFix = fix; logln(fix ? "EVENTO: GPS fix ADQUIRIDO" : "EVENTO: GPS fix PERDIDO"); }
+}
+void connService() {
+  if (!wifiActive) return;
+  if (!tcpClient || !tcpClient.connected()) {
+    WiFiClient nc = tcpServer.available();
+    if (nc) { tcpClient = nc; authed[CH_TCP] = false; lens[CH_TCP] = 0; tcpClient.printf("DOSAPALM TCP. Envia: clave <codigo>\n"); logln("EVENTO: cliente TCP conectado"); }
+  }
+  static bool prevTCP = false; bool tc = (tcpClient && tcpClient.connected());
+  if (tc != prevTCP) { prevTCP = tc; if (!tc) { authed[CH_TCP] = false; logln("EVENTO: cliente TCP desconectado"); } }
+  static int prevSta = 0; int sta = WiFi.softAPgetStationNum();
+  if (sta != prevSta) { logln("EVENTO: estaciones WiFi: " + String(sta)); prevSta = sta; }
+}
+void bleConnLogService() {
+  static bool prevBle = false;
+  if (bleActive && bleConnected != prevBle) {
+    prevBle = bleConnected;
+    // v8: la salida LD (panel auxiliar) refleja la conexion Bluetooth.
+    ldOn = bleConnected;
+    digitalWrite(PIN_LD, ldOn ? HIGH : LOW);
+    logln(bleConnected ? "EVENTO: cliente BLE conectado (LD encendido)" : "EVENTO: cliente BLE desconectado (LD apagado)");
+    logln(String("LD ") + (ldOn ? "on" : "off"));
+  }
+}
+void logService() { if (logOn && millis()-tLog >= 1000) { tLog = millis(); printLogCSV(); } }
+
+// ---------------- SETUP / LOOP ----------------
+void setup() {
+  Serial.begin(115200);
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  pinMode(PIN_LED_R, OUTPUT); pinMode(PIN_LED_G, OUTPUT); pinMode(PIN_LED_B, OUTPUT);
+  pinMode(PIN_AUX, OUTPUT); pinMode(PIN_LD, OUTPUT); pinMode(PIN_BTN, INPUT); pinMode(PIN_HALL, INPUT);
+  // Canales LEDC EXPLICITOS (leccion de campo #2). En el ESP32 cada par de
+  // canales comparte un timer: ch0/ch1 -> timer0, ch2/ch3 -> timer1, etc.
+  // La turbina (5 kHz) queda SOLA en el timer0; dosificador y tolva (ambos
+  // 1 kHz) comparten el timer1 sin conflicto. Asi ninguna version del core
+  // puede colgar un motor del timer de la turbina.
+  // v8.4: cada motor en SU PROPIO timer (ch0->t0, ch2->t1, ch4->t2) para que
+  // las frecuencias sean independientes. Los cambios en caliente usan
+  // ledcChangeFrequency (NUNCA detach/attach: leccion de campo #1).
+  ledcAttachChannel(PIN_TURB, freqTurb, RES_TURB, 0);   // ch0 -> timer0
+  ledcAttachChannel(PIN_DOSF, freqDosf, RES_MOT,  2);   // ch2 -> timer1
+  ledcAttachChannel(PIN_TOL,  freqTol,  RES_MOT,  4);   // ch4 -> timer2
+  attachInterrupt(digitalPinToInterrupt(PIN_HALL), hallISR, FALLING);
+  allSafe(); hallWindowStart = millis();
+
+  loadPrefs();
+
+  // v8/P0-1: sistema de archivos para los eventos (formatea si es primera vez).
+  if (!LittleFS.begin(true)) Serial.println("!! LittleFS no monto: eventos NO persistiran");
+  if (sdEnabled) sdMount();   // v9.6: respaldo microSD si esta habilitado
+
+  // ---- UNA sola conexion inalambrica ----
+  if (connMode == CONN_WIFI) {
+    WiFi.mode(WIFI_AP);
+    // v8/P0-2: SSID unico por equipo.
+    WiFi.softAP(devSerial.c_str(), WIFI_AP_PASS, WIFI_CHAN, 0, 4);
+    WiFi.setSleep(false);
+    tcpServer.begin(); wsServer.begin(); wsServer.onEvent(onWsEvent);
+    wifiActive = true;
+  } else {
+    bleSetup();
+  }
+
+  Serial.println();
+  Serial.println("=====================================================");
+  Serial.printf ("  DOSAPALM FIRMWARE v%s (fuente unica: dosapalm/firmware)\n", FW_VERSION);
+  Serial.printf ("  Serial: %s | Conexion: %s | EVT pendientes: %lu\n", devSerial.c_str(), connMode==CONN_BLE?"BLE":"WiFi", (unsigned long)evtCount());
+  if (wifiActive) Serial.printf("  WiFi '%s' -> WS ws://%s:%u/ | TCP :%u\n", devSerial.c_str(), WiFi.softAPIP().toString().c_str(), WS_PORT, TCP_PORT);
+  else            Serial.printf("  BLE UART: busca '%s' por Bluetooth en la app\n", devSerial.c_str());
+  Serial.println("  BLE/TCP/WS requieren: clave <codigo>");
+  // v9.0: arranque directo en MODO REAL (LED rojo = power)
+  digitalWrite(PIN_LED_R, HIGH);
+  Serial.println("  MODO REAL activo (arranque automatico). Cambiar: 'modo prueba' | 'modo real'");
+  if (!cfgOk) Serial.println("  !! TARJETA SIN CONFIGURAR: la app debe enviar la configuracion (vista Configuracion)");
+  Serial.println("=====================================================");
+}
+
+void loop() {
+  gpsService();
+  ioService();
+  opLedService();   // v9.4: titileo del LED rojo mientras hay OPERACION
+  bleLedService();  // v10.0: LED azul = Bluetooth (titila en espera, fijo conectado)
+  if (finRepetirAt && millis() >= finRepetirAt) { finRepetirAt = 0; logln(finRepetir); }   // v9.7
+  if (wifiActive) wsServer.loop();
+  connService();
+  bleConnLogService();
+  turbUpdate();
+  seqUpdate();
+  dosService();
+  calService();              // v8: calibracion solo-dosificador
+  kickService();             // v8.3: fin de la patada de arranque
+  arranqueService();         // v8.3: escalada de duty hasta el primer pulso
+  retardoControlService();   // v8/P1-5
+  dutyReportService();       // v8.5: PWM del GPIO del dosf en vivo
+  timerService();
+  hallService();
+  stallService();
+  bootLedService();
+  eventService();
+  configService();
+  realLedService();
+  monService();
+  logService();
+}
