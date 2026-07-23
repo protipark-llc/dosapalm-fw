@@ -39,7 +39,7 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "11.1";
+const char* FW_VERSION = "11.5";
 const char* WIFI_AP_PASS = "dosapalm2026";
 const uint8_t  WIFI_CHAN = 6;
 const uint16_t TCP_PORT  = 3333;
@@ -439,9 +439,21 @@ void evtSince(uint32_t since) {
     String line = f.readStringUntil('\n');
     line.trim();
     if (line.length() == 0) continue;
-    if (evtLineSeq(line) > since) { out.println(line); sent++; }
+    if (evtLineSeq(line) > since) {
+      out.println(line);
+      sent++;
+      // v11.5: ritmo en la rafaga — sin pausa, la pila BLE descarta
+      // notificaciones cuando se encolan muchas lineas seguidas y la app
+      // recibe menos eventos de los enviados (y entonces NO purga, correcto
+      // pero la memoria nunca se libera).
+      if (bleConnected) delay(15);
+    }
   }
   f.close();
+  out.printf("EVT END %lu\n", (unsigned long)sent);
+  // v11.5: EVT END es la linea que AUTORIZA la purga — repetirla cubre la
+  // perdida de una notificacion BLE. La app ignora el duplicado.
+  delay(180);
   out.printf("EVT END %lu\n", (unsigned long)sent);
 }
 void evtAck(uint32_t upTo) {
