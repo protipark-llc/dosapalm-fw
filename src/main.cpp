@@ -39,7 +39,7 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "11.0";
+const char* FW_VERSION = "11.1";
 const char* WIFI_AP_PASS = "dosapalm2026";
 const uint8_t  WIFI_CHAN = 6;
 const uint16_t TCP_PORT  = 3333;
@@ -1080,6 +1080,27 @@ void handleCommand(String cmd, int ch) {
     } else {
       logln(String("CONFIGURADO: ") + (cfgOk ? "SI" : "NO"));
     }
+  }
+  else if (t[0] == "fabrica") {
+    // v11.1: borra TODA la configuracion guardada de la tarjeta y reinicia.
+    // Se PRESERVAN: serial (identidad), evtseq (integridad de la base de datos
+    // de la app: la secuencia nunca puede retroceder), modo de conexion y los
+    // eventos pendientes en /events.csv (datos de campo, no configuracion).
+    if (t[1] != "confirmar") { logln("FABRICA: borra TODA la configuracion (dosis, tiempos, PWM, holds, rearme, antirebote, bandera de configurada...) y reinicia. Se conservan serial, secuencia de eventos y datos pendientes. Envia: fabrica confirmar"); return; }
+    allSafe();
+    prefs.begin("dosapalm", false);
+    String kSerial = prefs.getString("serial", devSerial);
+    uint32_t kSeq = prefs.getULong("evtseq", evtSeq);
+    uint8_t kConn = prefs.getUChar("conn", (uint8_t)connMode);
+    prefs.clear();
+    prefs.putString("serial", kSerial);
+    prefs.putULong("evtseq", kSeq);
+    prefs.putUChar("conn", kConn);
+    prefs.end();
+    cfgOk = false;
+    logln("FABRICA OK: configuracion borrada por completo (serial, secuencia y datos pendientes conservados). Reiniciando...");
+    delay(400);
+    ESP.restart();
   }
   else if (t[0] == "rearme") {
     // v9.1: ventana anti-repeticion tras cada ciclo (persistente; 0 = sin bloqueo)
