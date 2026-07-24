@@ -31,6 +31,8 @@
 #include <BLE2902.h>
 #include <LittleFS.h>
 #include <SD.h>   // v9.6: respaldo opcional de eventos en microSD
+#include <Update.h>            // v11.9: OTA por comandos (app -> equipo)
+#include "mbedtls/base64.h"    // v11.9: trozos OTA en base64 por el protocolo de texto
 
 // ---------------- CONFIG ----------------
 /*
@@ -39,7 +41,9 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "11.5";
+const char* FW_VERSION = "11.9";
+// v11.9: estado del OTA por comandos
+bool otaActive = false; uint32_t otaSize = 0, otaRecv = 0;
 const char* WIFI_AP_PASS = "dosapalm2026";
 const uint8_t  WIFI_CHAN = 6;
 const uint16_t TCP_PORT  = 3333;
@@ -141,10 +145,11 @@ enum { CH_USB = 0, CH_BT = 1, CH_TCP = 2, CH_WS = 3, N_CH = 4 };
 const char* chName[N_CH] = {"USB", "BLE", "TCP", "WS"};
 // v8/P1-6: solo el USB fisico entra autorizado. BLE, TCP y WS exigen 'clave'.
 bool  authed[N_CH] = {true, false, false, false};
-char  bufs[N_CH][80];
+// v11.9: 600 para que quepan los trozos base64 del OTA (antes 80)
+char  bufs[N_CH][600];
 size_t lens[N_CH] = {0, 0, 0, 0};
 
-volatile char     bleRing[256];
+volatile char     bleRing[2048];   // v11.9: agrandado para los trozos OTA
 volatile uint16_t bleHead = 0, bleTail = 0;
 
 // ---------------- ESTADO ----------------
@@ -1030,11 +1035,11 @@ void handleCommand(String cmd, int ch) {
     // v10.3: presion minima del pulsador (antirebote/antirruido, persistente)
     uint32_t ms = (uint32_t) t[1].toInt();
     if (t[1].length() == 0) logln("Antirebote del pulsador = " + String(btnMinMs) + " ms");
-    else if (ms >= 30 && ms <= 1000) {
+    else if (ms >= 10 && ms <= 1000) {   // v11.9: minimo 10 ms (pulsos RF cortos)
       btnMinMs = ms;
       prefs.begin("dosapalm", false); prefs.putULong("btnmin", btnMinMs); prefs.end();
       logln("Antirebote del pulsador = " + String(btnMinMs) + " ms");
-    } else logln("Uso: rebote <30-1000> ms (actual " + String(btnMinMs) + ")");
+    } else logln("Uso: rebote <10-1000> ms (actual " + String(btnMinMs) + ")");
   }
   else if (t[0] == "guardar") {
     // v10.1: persistir la configuracion de dosificacion vigente en NVS — es la
@@ -1078,6 +1083,9 @@ void handleCommand(String cmd, int ch) {
     else if (t[1] == "bt" && ms >= 1000) { btHoldMs = ms; prefs.begin("dosapalm", false); prefs.putULong("holdbt", ms); prefs.end(); logln("Pulsacion para BLUETOOTH = " + String(ms) + " ms"); }
     else logln("Uso: hold op <ms> | hold bt <ms> (min 1000; actual op " + String(opHoldMs) + " / bt " + String(btHoldMs) + ")");
     if (btHoldMs >= opHoldMs) logln("AVISO: la pulsacion de bluetooth (" + String(btHoldMs) + " ms) deberia ser MENOR que la de operacion (" + String(opHoldMs) + " ms)");
+    // v11.9: una pulsacion "normal" del control RF puede durar 1-3 s — si el
+    // umbral de operacion es tan corto, cada aplicacion APAGA la operacion.
+    if (opHoldMs < 3000) logln("AVISO: pulsacion de OPERACION muy corta (" + String(opHoldMs) + " ms) - una presion normal del control puede apagar la operacion sin querer; usa 5000 ms o mas");
   }
   else if (t[0] == "configurado") {
     // v9.2: bandera de configuracion aplicada (persistente)
@@ -1092,6 +1100,45 @@ void handleCommand(String cmd, int ch) {
     } else {
       logln(String("CONFIGURADO: ") + (cfgOk ? "SI" : "NO"));
     }
+  }
+  else if (t[0] == "ota") {
+    // v11.9: ACTUALIZACION DEL FIRMWARE por el mismo protocolo de texto (BLE o
+    // Wi-Fi; Wi-Fi es MUCHO mas rapido). Flujo: `ota begin <bytes>` ->
+    // "OTA BEGIN OK"; N lineas `ota data <base64>` -> "OTA <recibido> <total>"
+    // (la app espera cada eco antes del siguiente trozo: control de flujo);
+    // `ota end` -> verifica, "OTA OK" y reinicia con el firmware nuevo.
+    // Requiere la tabla de particiones min_spiffs (dos slots de app).
+    if (t[1] == "begin") {
+      size_t sz = (size_t) t[2].toInt();
+      if (sz == 0) { logln("Uso: ota begin <bytes> | ota data <base64> | ota end | ota abort"); return; }
+      allSafe();
+      if (opActive) setOperacion(false);
+      if (!Update.begin(sz)) { out.printf("OTA ERROR begin: %s\n", Update.errorString()); return; }
+      otaActive = true; otaSize = sz; otaRecv = 0;
+      out.println("OTA BEGIN OK");
+    }
+    else if (t[1] == "data") {
+      if (!otaActive) { out.println("OTA ERROR: sin 'ota begin'"); return; }
+      // el payload va en `raw` (¡base64 distingue mayusculas; cmd esta en minusculas!)
+      int sp = raw.indexOf(' ', raw.indexOf(' ') + 1);
+      if (sp < 0) { out.println("OTA ERROR: trozo vacio"); return; }
+      String b64 = raw.substring(sp + 1); b64.trim();
+      static uint8_t bin[512];
+      size_t n = 0;
+      int rc = mbedtls_base64_decode(bin, sizeof(bin), &n, (const unsigned char*)b64.c_str(), b64.length());
+      if (rc != 0 || n == 0) { out.println("OTA ERROR: base64 invalido"); return; }
+      if (Update.write(bin, n) != n) { out.printf("OTA ERROR write: %s\n", Update.errorString()); Update.abort(); otaActive = false; return; }
+      otaRecv += n;
+      out.printf("OTA %lu %lu\n", (unsigned long)otaRecv, (unsigned long)otaSize);
+    }
+    else if (t[1] == "end") {
+      if (!otaActive) { out.println("OTA ERROR: sin 'ota begin'"); return; }
+      otaActive = false;
+      if (Update.end(true)) { out.println("OTA OK: firmware verificado - reiniciando..."); delay(600); ESP.restart(); }
+      else out.printf("OTA ERROR end: %s\n", Update.errorString());
+    }
+    else if (t[1] == "abort") { if (otaActive) { Update.abort(); otaActive = false; } out.println("OTA ABORTADA"); }
+    else out.printf("OTA: %s | recibido %lu de %lu\n", otaActive ? "EN CURSO" : "inactiva", (unsigned long)otaRecv, (unsigned long)otaSize);
   }
   else if (t[0] == "fabrica") {
     // v11.1: borra TODA la configuracion guardada de la tarjeta y reinicia.
@@ -1198,7 +1245,7 @@ void bleSetup() {
 void feedBleByte(char c) {
   int ch = CH_BT;
   if (c=='\n'||c=='\r') { if (lens[ch]>0) { bufs[ch][lens[ch]]='\0'; handleCommand(String(bufs[ch]), ch); lens[ch]=0; } }
-  else if (lens[ch] < 79) bufs[ch][lens[ch]++] = c;
+  else if (lens[ch] < 599) bufs[ch][lens[ch]++] = c;
   else lens[ch] = 0;
 }
 void drainBle() { while (bleTail != bleHead) { char c = bleRing[bleTail]; bleTail = (bleTail+1) % sizeof(bleRing); feedBleByte(c); } }
@@ -1208,7 +1255,7 @@ void feedChannel(int ch, Stream &s) {
   while (s.available()) {
     char c = s.read();
     if (c=='\n'||c=='\r') { if (lens[ch]>0) { bufs[ch][lens[ch]]='\0'; handleCommand(String(bufs[ch]), ch); lens[ch]=0; } }
-    else if (lens[ch] < 79) bufs[ch][lens[ch]++] = c;
+    else if (lens[ch] < 599) bufs[ch][lens[ch]++] = c;
     else { lens[ch]=0; out.println("Comando largo, descartado"); }
   }
 }
@@ -1278,7 +1325,10 @@ void eventService() {
     logln("EVENTO: pulsador sostenido " + String(opHoldMs) + " ms -> OPERACION (suelta el boton)");
     setOperacion(!opActive);
   }
-  if (b != prevBtn && millis()-tBtn > 50) {
+  // v11.9: el filtro de flancos respeta el antirebote configurado — con 20 ms
+  // configurados, el filtro fijo de 50 ms se tragaba pulsos RF legitimos.
+  uint32_t edgeMs = (btnMinMs < 50) ? btnMinMs : 50;
+  if (b != prevBtn && millis()-tBtn > edgeMs) {
     tBtn = millis(); prevBtn = b;
     if (b == LOW) {
       if (millis() < btnIgnoreUntil) { tPress = 0; logln("EVENTO: pulso ignorado (rebote tras accion sostenida)"); }
@@ -1296,7 +1346,12 @@ void eventService() {
       // v9.1: presion minima real — los pulsos de ruido son mas cortos que
       // una pulsacion humana y se descartan.
       else if (dur < btnMinMs) { logln("EVENTO: pulso descartado (<" + String(btnMinMs) + " ms, posible ruido)"); }
-      else if (dur >= btHoldMs) { logln("EVENTO: pulsador sostenido " + String(dur) + " ms -> bluetooth/config"); configToggle(); }
+      // v11.9: con la OPERACION ACTIVA el pulsador SOLO dosifica — una presion
+      // larga (1-3 s es normal en campo con el control RF) ya NO se convierte
+      // en "bluetooth/config" y deja al operario sin aplicacion. El gesto de
+      // bluetooth/config solo aplica SIN operacion; para salir de operacion
+      // sigue la pulsacion sostenida de opHoldMs (dispara sola, sin soltar).
+      else if (!opActive && dur >= btHoldMs) { logln("EVENTO: pulsador sostenido " + String(dur) + " ms -> bluetooth/config"); configToggle(); }
       else if (runMode == MODE_REAL && !configMode && dosState == DOS_IDLE) dosificarStart();
       holdConsumed = false; tPress = 0;
     }
