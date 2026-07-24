@@ -41,7 +41,11 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "11.9";
+const char* FW_VERSION = "12.2";
+// v12.2: red Wi-Fi COMPARTIDA (modo estacion) — el equipo se une al router o
+// hotspot de la finca ademas de su propio AP; asi VARIOS equipos conviven en
+// una misma red y la app los lista y elige a cual actualizar por OTA.
+String staSsid = "", staPass = "";
 // v11.9: estado del OTA por comandos
 bool otaActive = false; uint32_t otaSize = 0, otaRecv = 0;
 const char* WIFI_AP_PASS = "dosapalm2026";
@@ -776,6 +780,8 @@ void loadPrefs() {
     devSerial = String(s); prefs.putString("serial", devSerial);
   }
   connMode = (ConnMode) prefs.getUChar("conn", CONN_BLE);
+  staSsid = prefs.getString("stassid", "");   // v12.2: red compartida
+  staPass = prefs.getString("stapass", "");
   monIntervalMs = prefs.getULong("monms", 5000);
   evtSeq = prefs.getULong("evtseq", 0);   // v8/P0-1
   hallTimeoutMs = prefs.getULong("atascoms", 4000);   // v8.3
@@ -890,6 +896,9 @@ void printRed() {
   out.printf("  Serial/BLE/SSID: %s | Conn activa: %s\n", devSerial.c_str(), connMode==CONN_BLE?"BLE":"WiFi");
   if (connMode==CONN_BLE) out.printf("  BLE UART '%s' (%s)\n", devSerial.c_str(), bleConnected?"conectado":"anunciando");
   else { out.printf("  WiFi AP '%s' pass '%s' canal %d | WS ws://%s:%u/ | TCP %s:%u (clave %s)\n", devSerial.c_str(), WIFI_AP_PASS, WIFI_CHAN, WiFi.softAPIP().toString().c_str(), WS_PORT, WiFi.softAPIP().toString().c_str(), TCP_PORT, ACCESS_KEY); }
+  // v12.2: red compartida (estacion)
+  if (staSsid.length()) out.printf("  RED compartida '%s': %s%s\n", staSsid.c_str(), WiFi.status()==WL_CONNECTED?"conectado, IP ":"desconectado", WiFi.status()==WL_CONNECTED?WiFi.localIP().toString().c_str():"");
+  else out.println("  RED compartida: sin configurar (wifi red <ssid> <clave>)");
 }
 
 // ---------------- MON configurable ----------------
@@ -1099,6 +1108,35 @@ void handleCommand(String cmd, int ch) {
       logln("CONFIGURADO: NO (bandera borrada)");
     } else {
       logln(String("CONFIGURADO: ") + (cfgOk ? "SI" : "NO"));
+    }
+  }
+  else if (t[0] == "wifi") {
+    // v12.2: red Wi-Fi COMPARTIDA. `wifi red <ssid> <clave>` la guarda y se
+    // conecta (ademas del AP propio); `wifi solo` la borra; `wifi` = estado.
+    // El ssid no puede llevar espacios; la clave se toma de `raw` (respeta
+    // mayusculas). Con varios equipos en la misma red, la app los lista.
+    if (t[1] == "red" && t[2].length()) {
+      int p1 = raw.indexOf(' ');            // "wifi"
+      int p2 = raw.indexOf(' ', p1 + 1);    // "red"
+      int p3 = raw.indexOf(' ', p2 + 1);    // fin del ssid
+      String ss = (p3 > 0) ? raw.substring(p2 + 1, p3) : raw.substring(p2 + 1);
+      String pw = (p3 > 0) ? raw.substring(p3 + 1) : "";
+      ss.trim(); pw.trim();
+      staSsid = ss; staPass = pw;
+      prefs.begin("dosapalm", false); prefs.putString("stassid", staSsid); prefs.putString("stapass", staPass); prefs.end();
+      logln("WIFI RED guardada: '" + staSsid + "' - conectando...");
+      if (connMode == CONN_WIFI) { WiFi.mode(WIFI_AP_STA); WiFi.begin(staSsid.c_str(), staPass.c_str()); }
+      else logln("AVISO: el equipo esta en modo BLE - la red aplica al pasar a 'conn wifi'");
+    }
+    else if (t[1] == "solo") {
+      staSsid = ""; staPass = "";
+      prefs.begin("dosapalm", false); prefs.remove("stassid"); prefs.remove("stapass"); prefs.end();
+      if (connMode == CONN_WIFI) { WiFi.disconnect(); WiFi.mode(WIFI_AP); }
+      logln("WIFI RED borrada: el equipo queda solo con su AP propio");
+    }
+    else {
+      if (staSsid.length()) logln("WIFI RED '" + staSsid + "': " + (WiFi.status()==WL_CONNECTED ? ("conectado, IP " + WiFi.localIP().toString()) : "desconectado"));
+      else logln("WIFI RED: sin configurar. Uso: wifi red <ssid> <clave> | wifi solo");
     }
   }
   else if (t[0] == "ota") {
@@ -1377,6 +1415,13 @@ void connService() {
   if (tc != prevTCP) { prevTCP = tc; if (!tc) { authed[CH_TCP] = false; logln("EVENTO: cliente TCP desconectado"); } }
   static int prevSta = 0; int sta = WiFi.softAPgetStationNum();
   if (sta != prevSta) { logln("EVENTO: estaciones WiFi: " + String(sta)); prevSta = sta; }
+  // v12.2: estado de la red COMPARTIDA (la IP es la que la app escanea)
+  static bool prevRed = false; bool red = (WiFi.status() == WL_CONNECTED);
+  if (red != prevRed) {
+    prevRed = red;
+    if (red) logln("WIFI RED: conectado a '" + staSsid + "' con IP " + WiFi.localIP().toString());
+    else if (staSsid.length()) logln("WIFI RED: desconectado de '" + staSsid + "' (reintentando)");
+  }
 }
 void bleConnLogService() {
   static bool prevBle = false;
@@ -1419,7 +1464,10 @@ void setup() {
 
   // ---- UNA sola conexion inalambrica ----
   if (connMode == CONN_WIFI) {
-    WiFi.mode(WIFI_AP);
+    // v12.2: si hay una red compartida guardada, AP + ESTACION a la vez — el
+    // AP propio sigue siendo el respaldo de campo.
+    if (staSsid.length()) { WiFi.mode(WIFI_AP_STA); WiFi.begin(staSsid.c_str(), staPass.c_str()); }
+    else WiFi.mode(WIFI_AP);
     // v8/P0-2: SSID unico por equipo.
     WiFi.softAP(devSerial.c_str(), WIFI_AP_PASS, WIFI_CHAN, 0, 4);
     WiFi.setSleep(false);
