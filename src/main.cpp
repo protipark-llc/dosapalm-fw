@@ -41,13 +41,19 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "12.2";
+const char* FW_VERSION = "12.5";
 // v12.2: red Wi-Fi COMPARTIDA (modo estacion) — el equipo se une al router o
 // hotspot de la finca ademas de su propio AP; asi VARIOS equipos conviven en
 // una misma red y la app los lista y elige a cual actualizar por OTA.
 String staSsid = "", staPass = "";
 // v11.9: estado del OTA por comandos
 bool otaActive = false; uint32_t otaSize = 0, otaRecv = 0;
+// v12.5: BUG de campo (cliente): al caerse el Bluetooth con el dosificador
+// encendido desde Pruebas ('dosf 60'), el motor quedaba girando PARA SIEMPRE
+// (nadie envia el 'off'). Cualquier desconexion de cliente con salidas activas
+// fuera de un ciclo real -> SAFE. El flag se marca en los callbacks y el
+// trabajo se hace en el loop (contexto seguro).
+volatile bool linkDropped = false;
 const char* WIFI_AP_PASS = "dosapalm2026";
 const uint8_t  WIFI_CHAN = 6;
 const uint16_t TCP_PORT  = 3333;
@@ -1249,6 +1255,7 @@ class ServerCB : public BLEServerCallbacks {
   void onDisconnect(BLEServer* s) override {
     bleConnected = false;
     authed[CH_BT] = false;   // v8/P1-6: cada conexion BLE debe autorizarse de nuevo
+    linkDropped = true;      // v12.5: SAFE si quedaron salidas de prueba activas
     s->getAdvertising()->start();
   }
 };
@@ -1312,6 +1319,7 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t len) {
       break;
     case WStype_DISCONNECTED:
       authed[CH_WS] = false;
+      linkDropped = true;   // v12.5: SAFE si quedaron salidas de prueba activas
       logln("EVENTO: cliente WebSocket desconectado");
       break;
     case WStype_TEXT: { String cmd = ""; for (size_t i=0;i<len;i++) cmd += (char)payload[i]; cmd.trim(); if (cmd.length()) handleCommand(cmd, CH_WS); break; }
@@ -1320,6 +1328,23 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t len) {
 }
 
 // ---------------- SERVICIOS ----------------
+// v12.5: guardian de desconexion — si un cliente se cae dejando salidas de
+// prueba encendidas (dosf/turb/tol/secuencia SIN ciclo real en curso), el
+// equipo se pone en SAFE solo. Un ciclo real en curso NO se toca: es corto,
+// autonomo y cierra por si mismo. Un OTA a medias se aborta (el firmware
+// actual sigue intacto).
+void linkGuardService() {
+  if (!linkDropped) return;
+  linkDropped = false;
+  if (otaActive) { Update.abort(); otaActive = false; logln("EVENTO: cliente desconectado a mitad de OTA -> abortado (el firmware actual queda intacto)"); }
+  // la calibracion tambien cuenta: es actividad de banco dirigida por la app —
+  // sin app no debe seguir girando (allSafe la aborta).
+  bool salidasLibres = (dosState == DOS_IDLE) && (turbPct > 0 || dosfPct > 0 || tolPct > 0 || seqCur != nullptr || calActive);
+  if (salidasLibres) {
+    allSafe();
+    logln("EVENTO: cliente desconectado con salidas activas -> SAFE (motores apagados)");
+  }
+}
 void hallService() { if (millis()-hallWindowStart >= 1000) { hallHz = (hallCount-hallCountWindow)*1000.0/(millis()-hallWindowStart); hallCountWindow=hallCount; hallWindowStart=millis(); } }
 void stallService() {
   if (!dosfStallGuard || dosfPct == 0) return;
@@ -1412,7 +1437,7 @@ void connService() {
     if (nc) { tcpClient = nc; authed[CH_TCP] = false; lens[CH_TCP] = 0; tcpClient.printf("DOSAPALM TCP. Envia: clave <codigo>\n"); logln("EVENTO: cliente TCP conectado"); }
   }
   static bool prevTCP = false; bool tc = (tcpClient && tcpClient.connected());
-  if (tc != prevTCP) { prevTCP = tc; if (!tc) { authed[CH_TCP] = false; logln("EVENTO: cliente TCP desconectado"); } }
+  if (tc != prevTCP) { prevTCP = tc; if (!tc) { authed[CH_TCP] = false; linkDropped = true; logln("EVENTO: cliente TCP desconectado"); } }
   static int prevSta = 0; int sta = WiFi.softAPgetStationNum();
   if (sta != prevSta) { logln("EVENTO: estaciones WiFi: " + String(sta)); prevSta = sta; }
   // v12.2: estado de la red COMPARTIDA (la IP es la que la app escanea)
@@ -1501,6 +1526,7 @@ void loop() {
   if (wifiActive) wsServer.loop();
   connService();
   bleConnLogService();
+  linkGuardService();   // v12.5: SAFE si un cliente se cae con salidas activas
   turbUpdate();
   seqUpdate();
   dosService();
