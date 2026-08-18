@@ -41,7 +41,7 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "12.5";
+const char* FW_VERSION = "12.7";
 // v12.2: red Wi-Fi COMPARTIDA (modo estacion) — el equipo se une al router o
 // hotspot de la finca ademas de su propio AP; asi VARIOS equipos conviven en
 // una misma red y la app los lista y elige a cual actualizar por OTA.
@@ -54,6 +54,13 @@ bool otaActive = false; uint32_t otaSize = 0, otaRecv = 0;
 // fuera de un ciclo real -> SAFE. El flag se marca en los callbacks y el
 // trabajo se hace en el loop (contexto seguro).
 volatile bool linkDropped = false;
+// v12.7: guardian de conexion BLE ZOMBI — si el navegador se recarga sin
+// cerrar el GATT, el equipo queda "conectado" sin anunciar y nadie puede
+// reconectar. La app viva SIEMPRE manda algo en <15 s (sondeos); sin trafico
+// entrante en 60 s se expulsa la conexion y se vuelve a anunciar.
+BLEServer* pBleServer = nullptr;
+volatile uint32_t bleLastRxMs = 0;
+const uint32_t BLE_IDLE_KICK_MS = 60000;
 const char* WIFI_AP_PASS = "dosapalm2026";
 const uint8_t  WIFI_CHAN = 6;
 const uint16_t TCP_PORT  = 3333;
@@ -1251,7 +1258,7 @@ void handleCommand(String cmd, int ch) {
 
 // ---------------- BLE ----------------
 class ServerCB : public BLEServerCallbacks {
-  void onConnect(BLEServer* s) override { bleConnected = true; }
+  void onConnect(BLEServer* s) override { bleConnected = true; bleLastRxMs = millis(); }
   void onDisconnect(BLEServer* s) override {
     bleConnected = false;
     authed[CH_BT] = false;   // v8/P1-6: cada conexion BLE debe autorizarse de nuevo
@@ -1261,6 +1268,7 @@ class ServerCB : public BLEServerCallbacks {
 };
 class RxCB : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* c) override {
+    bleLastRxMs = millis();   // v12.7: la app viva siempre escribe algo
     String v = c->getValue();
     for (int i = 0; i < (int)v.length(); i++) { uint16_t nh = (bleHead + 1) % sizeof(bleRing); if (nh != bleTail) { bleRing[bleHead] = v[i]; bleHead = nh; } }
   }
@@ -1274,7 +1282,8 @@ void bleNotifyLine(const char* s, size_t n) {
 void bleSetup() {
   BLEDevice::init(devSerial.c_str());
   BLEDevice::setMTU(185);
-  BLEServer* pServer = BLEDevice::createServer();
+  pBleServer = BLEDevice::createServer();
+  BLEServer* pServer = pBleServer;
   pServer->setCallbacks(new ServerCB());
   BLEService* pSvc = pServer->createService(NUS_SERVICE_UUID);
   pTxChar = pSvc->createCharacteristic(NUS_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
@@ -1448,6 +1457,15 @@ void connService() {
     else if (staSsid.length()) logln("WIFI RED: desconectado de '" + staSsid + "' (reintentando)");
   }
 }
+void bleZombieService() {
+  // v12.7: expulsar la conexion BLE muerta (recarga del navegador sin cierre
+  // limpio del GATT) para volver a anunciar y quedar disponible de inmediato.
+  if (!bleConnected || pBleServer == nullptr) return;
+  if (millis() - bleLastRxMs < BLE_IDLE_KICK_MS) return;
+  logln("BLE: cliente sin trafico > " + String(BLE_IDLE_KICK_MS/1000) + " s (conexion zombi) -> expulsado, anunciando de nuevo");
+  pBleServer->disconnect(pBleServer->getConnId());
+  bleLastRxMs = millis();   // no re-disparar mientras el stack procesa el cierre
+}
 void bleConnLogService() {
   static bool prevBle = false;
   if (bleActive && bleConnected != prevBle) {
@@ -1526,6 +1544,7 @@ void loop() {
   if (wifiActive) wsServer.loop();
   connService();
   bleConnLogService();
+  bleZombieService();   // v12.7: expulsar conexiones BLE muertas (recarga sin cierre)
   linkGuardService();   // v12.5: SAFE si un cliente se cae con salidas activas
   turbUpdate();
   seqUpdate();
