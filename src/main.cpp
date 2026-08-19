@@ -43,7 +43,7 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "13.2";
+const char* FW_VERSION = "13.3";
 // v12.9: PROTECCION ANTI-RUIDO del Hall (motor de tolva de mayor potencia -> EMI
 // que inducia pulsos falsos, saturaba el log por BLE, colgaba el loop y dejaba la
 // tolva a 12V sin poder apagarla con SAFE). Cuatro capas: (1) compuerta de periodo
@@ -198,6 +198,15 @@ float    hallHzMax    = 150.0;          // Hz de Hall IMPOSIBLE -> auto-SAFE (re
 uint32_t hallMinLowUs = 2000;           // duracion minima del BAJO para contar (us)
 volatile uint32_t hallLowStartUs = 0;
 volatile bool     hallLowPend = false;
+// v13.3: CUARENTENA por tormenta de ruido — si el pin del hall recibe flancos
+// a una tasa absurda (linea flotante + EMI/sonda: fisicamente imposible en el
+// piñon), se hace SAFE y se DESCONECTA la interrupcion un tiempo: el equipo
+// deja de leer/loguear/parpadear por completo y se reactiva solo, vigilando.
+volatile uint32_t hallEdgesRaw = 0;     // TODOS los flancos (antes de filtros)
+uint32_t hallStormMax = 400;            // flancos/s para cuarentena. Cmd 'hallstorm'
+bool     hallCuarentena = false;
+uint32_t hallCuarHasta = 0;
+uint8_t  hallStormSeguidas = 0;
 uint32_t dosfStartMs = 0, dosfPulsesAtStart = 0;
 bool     bootLedDone = false;
 
@@ -321,6 +330,7 @@ volatile uint32_t hallRuidoIgn = 0;
 // cavidad real = milisegundos; un glitch EMI de la turbina = microsegundos).
 // Lectura de nivel directa al registro (segura en IRAM).
 void IRAM_ATTR hallISR() {
+  hallEdgesRaw++;   // v13.3: tasa cruda de flancos (detector de tormenta)
   uint32_t now = micros();
   bool nivel = (REG_READ(GPIO_IN_REG) >> PIN_HALL) & 1;
   if (!nivel) {   // BAJO: candidato a pulso — arranca el cronometro
@@ -876,6 +886,7 @@ void loadPrefs() {
   btnMinMs = prefs.getULong("btnmin", 150);           // v10.3
   hallMinGapUs = prefs.getULong("hallmin", 3000);     // v12.9: compuerta anti-ruido Hall (us)
   hallMinLowUs = prefs.getULong("hallpulso", 2000);   // v13.1: duracion minima del BAJO (us)
+  hallStormMax = prefs.getULong("hallstorm", 400);    // v13.3: flancos/s -> cuarentena
   hallHzMax    = prefs.getFloat("hallmax", 150.0);    // v12.9: Hz imposible -> auto-SAFE
   freqTurb = prefs.getULong("fturb", 5000);           // v8.4
   freqDosf = prefs.getULong("fdosf", 1000);
@@ -1146,6 +1157,16 @@ void handleCommand(String cmd, int ch) {
       prefs.begin("dosapalm", false); prefs.putULong("hallpulso", hallMinLowUs); prefs.end();
       logln("Pulso Hall minimo = " + String(hallMinLowUs) + " us");
     } else logln("Uso: hallpulso <0-50000> us (actual " + String(hallMinLowUs) + ")");
+  }
+  else if (t[0] == "hallstorm") {
+    // v13.3: tasa de flancos/s que dispara SAFE + cuarentena del sensor.
+    uint32_t fs = (uint32_t) t[1].toInt();
+    if (t[1].length() == 0) logln("Tormenta Hall = " + String(hallStormMax) + " flancos/s" + (hallCuarentena ? " | CUARENTENA ACTIVA" : ""));
+    else if (fs >= 100 && fs <= 5000) {
+      hallStormMax = fs;
+      prefs.begin("dosapalm", false); prefs.putULong("hallstorm", hallStormMax); prefs.end();
+      logln("Tormenta Hall = " + String(hallStormMax) + " flancos/s");
+    } else logln("Uso: hallstorm <100-5000> flancos/s (actual " + String(hallStormMax) + ")");
   }
   else if (t[0] == "hallmax") {
     // v12.9: Hz de Hall imposible -> auto-SAFE. Debe ser MAYOR que el maximo real (~10-50 Hz).
@@ -1451,6 +1472,40 @@ void linkGuardService() {
 void hallService() { if (millis()-hallWindowStart >= 1000) { hallHz = (hallCount-hallCountWindow)*1000.0/(millis()-hallWindowStart); hallCountWindow=hallCount; hallWindowStart=millis(); } }
 // v12.9: si el Hall reporta una frecuencia IMPOSIBLE (ruido EMI del motor), apaga
 // los motores en vez de seguir girando a 12V. Solo actua si hay algo encendido.
+// v13.3: detector de TORMENTA — mide la tasa cruda de flancos cada 500 ms.
+// Si supera hallStormMax (default 400/s; lo real es <50/s), aborta cualquier
+// dosis con evento de error, hace SAFE y pone el sensor en CUARENTENA
+// (detachInterrupt): cero lecturas, cero log, cero parpadeo del LED verde.
+// Se reactiva solo (5 s, escalando hasta 25 s si la tormenta persiste).
+void hallStormService() {
+  static uint32_t tWin = 0, prevEdges = 0;
+  if (hallCuarentena) {
+    if ((int32_t)(millis() - hallCuarHasta) < 0) return;
+    hallCuarentena = false;
+    prevEdges = hallEdgesRaw; tWin = millis();
+    hallLowPend = false;
+    attachInterrupt(digitalPinToInterrupt(PIN_HALL), hallISR, CHANGE);
+    logln("HALL: fin de la cuarentena - sensor reactivado (vigilando la tasa de flancos)");
+    return;
+  }
+  if (millis() - tWin < 500) return;
+  uint32_t porSeg = (hallEdgesRaw - prevEdges) * 2;
+  prevEdges = hallEdgesRaw; tWin = millis();
+  if (porSeg > hallStormMax) {
+    detachInterrupt(digitalPinToInterrupt(PIN_HALL));
+    hallCuarentena = true;
+    if (hallStormSeguidas < 5) hallStormSeguidas++;
+    uint32_t cuarMs = 5000u * hallStormSeguidas;
+    hallCuarHasta = millis() + cuarMs;
+    if (dosState != DOS_IDLE) {
+      uint32_t p = hallCount - dosStartPulses;
+      emitDoseEvent(p, p * GRAMS_PER_PULSE, "error");
+      dosState = DOS_IDLE; lastCycleEndMs = millis();
+    }
+    allSafe();
+    logln("!! TORMENTA DE RUIDO en el hall: " + String(porSeg) + " flancos/s (max " + String(hallStormMax) + ") -> SAFE y sensor en CUARENTENA " + String(cuarMs/1000) + " s. Linea flotante/EMI: revisar pull-up y cableado");
+  } else if (porSeg < 50 && hallStormSeguidas > 0) hallStormSeguidas--;
+}
 // v13.0: reporte periodico del ruido DESCARTADO (no cuenta, pero se informa
 // para que el tecnico vea la magnitud de la interferencia y revise cableado).
 void hallRuidoLogService() {
@@ -1714,6 +1769,7 @@ void loop() {
   hallService();
   hallNoiseService();   // v12.9: auto-SAFE si el Hall enloquece por ruido EMI
   hallRuidoLogService();  // v13.0: informe del ruido descartado por la ISR
+  hallStormService();     // v13.3: SAFE + cuarentena del sensor ante tormenta de flancos
   stallService();
   bootLedService();
   eventService();
