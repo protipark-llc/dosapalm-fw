@@ -43,7 +43,7 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "13.1";
+const char* FW_VERSION = "13.2";
 // v12.9: PROTECCION ANTI-RUIDO del Hall (motor de tolva de mayor potencia -> EMI
 // que inducia pulsos falsos, saturaba el log por BLE, colgaba el loop y dejaba la
 // tolva a 12V sin poder apagarla con SAFE). Cuatro capas: (1) compuerta de periodo
@@ -1482,14 +1482,22 @@ void stallService() {
   uint32_t jamMs    = max(hallTimeoutMs, (uint32_t)guardTarget * 4);
   bool huboPulsos = (hallCount != dosfPulsesAtStart);
   bool enDosis = (dosState != DOS_IDLE);
+  // v13.2: FALSO ATASCO de campo — carrera entre millis() y la ISR: si un
+  // pulso llegaba entre la lectura del reloj y la de hallLastPulseMs (con
+  // cruce de milisegundo), la resta sin signo desbordaba a ~4e9 ms y el
+  // guardian apagaba todo con el piñon girando bien. UNA foto del reloj y
+  // deltas CON SIGNO: un delta negativo (pulso recien llegado) nunca dispara.
+  uint32_t ahora = millis();
+  int32_t sinPulso     = (int32_t)(ahora - hallLastPulseMs);
+  int32_t desdeArranque = (int32_t)(ahora - dosfStartMs);
   // v9.5: cualquier atasco/fallo de hall durante la dosificacion dispara SAFE
   // COMPLETO — turbina, dosificador, tolva y secuencias, todo apagado.
-  if (!huboPulsos && (millis()-dosfStartMs > sensorMs)) {
+  if (!huboPulsos && desdeArranque > (int32_t)sensorMs) {
     if (enDosis) { uint32_t p = hallCount - dosStartPulses; emitDoseEvent(p, p*GRAMS_PER_PULSE, "error"); dosState=DOS_IDLE; lastCycleEndMs = millis(); }
     allSafe();
     logln("!! SENSOR HALL NO DETECTADO -> SAFE: todos los motores apagados. Revisar sensor/iman");
   }
-  else if (huboPulsos && (millis()-hallLastPulseMs > jamMs)) {
+  else if (huboPulsos && sinPulso > (int32_t)jamMs) {
     if (enDosis) { uint32_t p = hallCount - dosStartPulses; emitDoseEvent(p, p*GRAMS_PER_PULSE, "error"); dosState=DOS_IDLE; lastCycleEndMs = millis(); }
     allSafe();
     logln("!! ATASCO: hall callo -> SAFE: todos los motores apagados. Revisar pinon/granulos");
@@ -1599,7 +1607,9 @@ void bleZombieService() {
   // v12.7: expulsar la conexion BLE muerta (recarga del navegador sin cierre
   // limpio del GATT) para volver a anunciar y quedar disponible de inmediato.
   if (!bleConnected || pBleServer == nullptr) return;
-  if (millis() - bleLastRxMs < BLE_IDLE_KICK_MS) return;
+  // v13.2: delta CON SIGNO — bleLastRxMs lo escribe la tarea BLE y la misma
+  // carrera del falso atasco podria expulsar una conexion viva.
+  if ((int32_t)(millis() - bleLastRxMs) < (int32_t)BLE_IDLE_KICK_MS) return;
   logln("BLE: cliente sin trafico > " + String(BLE_IDLE_KICK_MS/1000) + " s (conexion zombi) -> expulsado, anunciando de nuevo");
   pBleServer->disconnect(pBleServer->getConnId());
   bleLastRxMs = millis();   // no re-disparar mientras el stack procesa el cierre
