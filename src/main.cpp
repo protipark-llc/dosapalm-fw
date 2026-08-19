@@ -43,7 +43,7 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "13.3";
+const char* FW_VERSION = "13.4";
 // v12.9: PROTECCION ANTI-RUIDO del Hall (motor de tolva de mayor potencia -> EMI
 // que inducia pulsos falsos, saturaba el log por BLE, colgaba el loop y dejaba la
 // tolva a 12V sin poder apagarla con SAFE). Cuatro capas: (1) compuerta de periodo
@@ -1495,6 +1495,16 @@ void hallStormService() {
     detachInterrupt(digitalPinToInterrupt(PIN_HALL));
     hallCuarentena = true;
     if (hallStormSeguidas < 5) hallStormSeguidas++;
+    // v13.4: ULTIMO RECURSO — si la tormenta reaparece tras 3 cuarentenas
+    // seguidas, el stack (BLE/GPIO) puede estar degradado: SAFE + REINICIO
+    // completo del firmware. Los eventos estan persistidos y el equipo
+    // arranca en modo normal, limpio.
+    if (hallStormSeguidas >= 4) {
+      allSafe();
+      logln("!! TORMENTA PERSISTENTE en el hall (4 cuarentenas seguidas) -> REINICIO de saneamiento del firmware...");
+      delay(600);
+      ESP.restart();
+    }
     uint32_t cuarMs = 5000u * hallStormSeguidas;
     hallCuarHasta = millis() + cuarMs;
     if (dosState != DOS_IDLE) {
