@@ -33,6 +33,7 @@
 #include <SD.h>   // v9.6: respaldo opcional de eventos en microSD
 #include <Update.h>            // v11.9: OTA por comandos (app -> equipo)
 #include "mbedtls/base64.h"    // v11.9: trozos OTA en base64 por el protocolo de texto
+#include "esp_task_wdt.h"      // v12.9: watchdog del loop (auto-reset + SAFE si se cuelga)
 
 // ---------------- CONFIG ----------------
 /*
@@ -41,7 +42,13 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "12.7";
+const char* FW_VERSION = "13.0";
+// v12.9: PROTECCION ANTI-RUIDO del Hall (motor de tolva de mayor potencia -> EMI
+// que inducia pulsos falsos, saturaba el log por BLE, colgaba el loop y dejaba la
+// tolva a 12V sin poder apagarla con SAFE). Cuatro capas: (1) compuerta de periodo
+// minimo en el ISR ('hallmin'), (2) no loguear pulso-a-pulso en rafagas anormales,
+// (3) auto-SAFE si el Hall reporta una frecuencia imposible ('hallmax'), (4) watchdog
+// del loop que reinicia en SAFE si se cuelga.
 // v12.2: red Wi-Fi COMPARTIDA (modo estacion) — el equipo se une al router o
 // hotspot de la finca ademas de su propio AP; asi VARIOS equipos conviven en
 // una misma red y la app los lista y elige a cual actualizar por OTA.
@@ -178,6 +185,10 @@ bool auxOn = false, ldOn = false, logOn = false;
 
 volatile uint32_t hallCount = 0;
 volatile uint32_t hallLastPulseMs = 0;
+// v12.9: proteccion anti-ruido del Hall (motor de mayor potencia -> mas EMI).
+volatile uint32_t hallLastEdgeUs = 0;   // ultimo flanco ACEPTADO (compuerta, us)
+uint32_t hallMinGapUs = 3000;           // ignora flancos < N us = glitch EMI (real ~100 ms). Cmd 'hallmin'
+float    hallHzMax    = 150.0;          // Hz de Hall IMPOSIBLE -> auto-SAFE (real ~10 Hz). Cmd 'hallmax'
 uint32_t dosfStartMs = 0, dosfPulsesAtStart = 0;
 bool     bootLedDone = false;
 
@@ -283,7 +294,27 @@ bool   hasLastFix = false;
 const char* EVT_FILE = "/events.csv";
 uint32_t evtSeq = 0;
 
-void IRAM_ATTR hallISR() { hallCount++; hallLastPulseMs = millis(); }
+// v12.9: COMPUERTA ANTI-RUIDO. El EMI del motor induce flancos falsos (rafagas de
+// microsegundos). Se ignora todo flanco que llegue antes de hallMinGapUs desde el
+// anterior ACEPTADO: el ruido es de us, los pulsos reales estan a decenas de ms.
+// micros() es seguro en IRAM. Lectura/escritura de uint32_t es atomica en el ESP32.
+// v13.0: CONTEO ARMADO — solo el dosificador mueve el piñon, asi que un pulso
+// hall con el dosificador APAGADO es fisicamente imposible: es ruido EMI de la
+// tolva/turbina inducido en la linea del sensor. La ISR lo descarta de raiz
+// (con 500 ms de gracia tras apagar, por la inercia del piñon). Esto elimina
+// el "miles de lecturas al encender la tolva en Pruebas": ni cuentan, ni se
+// loguean, ni disparan nada — solo suman al contador de ruido reportado.
+volatile bool hallArmado = false;
+volatile uint32_t hallGraciaHasta = 0;
+volatile uint32_t hallRuidoIgn = 0;
+void IRAM_ATTR hallISR() {
+  if (!hallArmado && (int32_t)(millis() - hallGraciaHasta) > 0) { hallRuidoIgn++; return; }
+  uint32_t now = micros();
+  if (now - hallLastEdgeUs < hallMinGapUs) { hallRuidoIgn++; return; }   // glitch EMI: descartar
+  hallLastEdgeUs = now;
+  hallCount++;
+  hallLastPulseMs = millis();
+}
 
 void logln(const String &s) { out.print("["); out.print(millis()); out.print("] "); out.println(s); }
 int pctToDuty(int pct, int cap) { pct = constrain(pct, 0, 100); return min((int)map(pct, 0, 100, 0, 255), cap); }
@@ -306,6 +337,10 @@ int pctToDuty(int pct, int cap) { pct = constrain(pct, 0, 100); return min((int)
  */
 int dosfAppliedDuty = 0;
 void dosfWrite(int duty) {
+  // v13.0: el conteo hall se ARMA solo con el dosificador en marcha (+gracia
+  // de 500 ms al apagar por la inercia del piñon).
+  if (duty > 0) hallArmado = true;
+  else if (hallArmado) { hallArmado = false; hallGraciaHasta = millis() + 500; }
   ledcWrite(PIN_DOSF, duty);
   dosfAppliedDuty = duty;
 }
@@ -816,6 +851,8 @@ void loadPrefs() {
   opHoldMs = prefs.getULong("holdop", 5000);          // v9.4
   btHoldMs = prefs.getULong("holdbt", 3000);          // v9.4
   btnMinMs = prefs.getULong("btnmin", 150);           // v10.3
+  hallMinGapUs = prefs.getULong("hallmin", 3000);     // v12.9: compuerta anti-ruido Hall (us)
+  hallHzMax    = prefs.getFloat("hallmax", 150.0);    // v12.9: Hz imposible -> auto-SAFE
   freqTurb = prefs.getULong("fturb", 5000);           // v8.4
   freqDosf = prefs.getULong("fdosf", 1000);
   freqTol  = prefs.getULong("ftol", 1000);
@@ -1063,6 +1100,27 @@ void handleCommand(String cmd, int ch) {
       logln("Antirebote del pulsador = " + String(btnMinMs) + " ms");
     } else logln("Uso: rebote <10-1000> ms (actual " + String(btnMinMs) + ")");
   }
+  else if (t[0] == "hallmin") {
+    // v12.9: compuerta anti-ruido del Hall (us). Ignora flancos mas rapidos que esto.
+    // Debe ser MENOR que el periodo real minimo entre pulsos (real ~100 ms = 100000 us).
+    uint32_t us = (uint32_t) t[1].toInt();
+    if (t[1].length() == 0) logln("Compuerta Hall = " + String(hallMinGapUs) + " us");
+    else if (us <= 50000) {   // hasta 50 ms; 0 = sin compuerta
+      hallMinGapUs = us;
+      prefs.begin("dosapalm", false); prefs.putULong("hallmin", hallMinGapUs); prefs.end();
+      logln("Compuerta Hall = " + String(hallMinGapUs) + " us");
+    } else logln("Uso: hallmin <0-50000> us (actual " + String(hallMinGapUs) + ")");
+  }
+  else if (t[0] == "hallmax") {
+    // v12.9: Hz de Hall imposible -> auto-SAFE. Debe ser MAYOR que el maximo real (~10-50 Hz).
+    float hz = t[1].toFloat();
+    if (t[1].length() == 0) logln("Hall max (auto-SAFE) = " + String(hallHzMax,0) + " Hz");
+    else if (hz >= 20 && hz <= 5000) {
+      hallHzMax = hz;
+      prefs.begin("dosapalm", false); prefs.putFloat("hallmax", hallHzMax); prefs.end();
+      logln("Hall max (auto-SAFE) = " + String(hallHzMax,0) + " Hz");
+    } else logln("Uso: hallmax <20-5000> Hz (actual " + String(hallHzMax,0) + ")");
+  }
   else if (t[0] == "guardar") {
     // v10.1: persistir la configuracion de dosificacion vigente en NVS — es la
     // que usa el boton fisico en cualquier ciclo, incluso tras reiniciar.
@@ -1248,7 +1306,7 @@ void handleCommand(String cmd, int ch) {
       // contador la volveria inalcanzable (sobredosis hasta el guardian).
       if (dosState != DOS_IDLE) logln("hall reset: RECHAZADO durante una dosificacion ('parar' primero)");
       else { hallCount=0; logln("Hall reseteado"); }
-    } else logln("Hall: " + String(hallCount) + " pulsos | " + String(hallCount*GRAMS_PER_PULSE,0) + " g");
+    } else logln("Hall: " + String(hallCount) + " pulsos | " + String(hallCount*GRAMS_PER_PULSE,0) + " g | ruido ignorado " + String(hallRuidoIgn) + " | conteo " + String(hallArmado ? "ARMADO" : "desarmado (dosf apagado)"));
   }
   else if (t[0] == "gps")  { if (t[1]=="raw") { int seg=t[2].length()?t[2].toInt():5; gpsRawUntil=millis()+(uint32_t)seg*1000; logln("GPS RAW "+String(seg)+"s"); } else if (t[1]=="loc") gpsLoc(); else if (t[1]=="maps") gpsMaps(); else if (t[1]=="sats") gpsSats(); else gpsFixPrint(); }
   else if (t[0] == "log")  { logOn=(t[1]=="on"); if (logOn) out.println("LOG,ms,turb,dosf,tol,hall_cnt,hall_hz,btn,fix,sats,lat,lng,hdop"); logln("LOG "+t[1]); }
@@ -1355,6 +1413,30 @@ void linkGuardService() {
   }
 }
 void hallService() { if (millis()-hallWindowStart >= 1000) { hallHz = (hallCount-hallCountWindow)*1000.0/(millis()-hallWindowStart); hallCountWindow=hallCount; hallWindowStart=millis(); } }
+// v12.9: si el Hall reporta una frecuencia IMPOSIBLE (ruido EMI del motor), apaga
+// los motores en vez de seguir girando a 12V. Solo actua si hay algo encendido.
+// v13.0: reporte periodico del ruido DESCARTADO (no cuenta, pero se informa
+// para que el tecnico vea la magnitud de la interferencia y revise cableado).
+void hallRuidoLogService() {
+  static uint32_t prevIgn = 0, tIgn = 0;
+  if (millis() - tIgn < 2000) return;
+  tIgn = millis();
+  uint32_t n = hallRuidoIgn;
+  if (n != prevIgn) {
+    logln("RUIDO EMI: +" + String(n - prevIgn) + " flancos hall IGNORADOS (dosificador apagado o glitch; total " + String(n) + "). Revisar cableado/apantallado del sensor");
+    prevIgn = n;
+  }
+}
+void hallNoiseService() {
+  if (hallHz <= hallHzMax) return;
+  bool algoEncendido = (dosfPct > 0 || tolPct > 0 || turbPct > 0 || turbDutyNow > 0 || opActive || dosState != DOS_IDLE);
+  if (!algoEncendido) return;
+  static uint32_t tNoiseSafe = 0;
+  if (millis() - tNoiseSafe < 2000) return;   // no spamear
+  tNoiseSafe = millis();
+  allSafe();
+  logln("SAFE AUTOMATICO: " + String(hallHz,0) + " Hz de Hall imposible (max " + String(hallHzMax,0) + " Hz) -> ruido EMI, motores apagados");
+}
 void stallService() {
   if (!dosfStallGuard || dosfPct == 0) return;
   // v8.3: el guardian usa el timeout CONFIGURABLE ('atasco <ms>') y ademas
@@ -1431,7 +1513,18 @@ void eventService() {
 
   static uint32_t hallPrinted = 0;
   if (hallPrinted > hallCount) hallPrinted = hallCount;
-  while (hallPrinted < hallCount) {
+  // v12.9: en operacion normal el Hall va lento (~10 Hz) y se loguea pulso a pulso.
+  // Si aparece un BACKLOG anormal (rafaga de ruido EMI), NO se loguea uno por uno:
+  // cada linea es una notificacion BLE lenta y el bucle nunca alcanzaba a hallCount
+  // -> loop() congelado -> SAFE no corria y la tolva quedaba a 12V. Se salta el
+  // conteo y se avisa 1 vez/seg. (El auto-SAFE y la compuerta atacan la causa.)
+  if (hallCount - hallPrinted > 30) {
+    hallPrinted = hallCount;
+    if (runMode == MODE_REAL) greenPulseUntil = millis() + 100;
+    static uint32_t tRuidoLog = 0;
+    if (millis() - tRuidoLog > 1000) { tRuidoLog = millis(); logln("AVISO: rafaga anormal de pulsos hall (posible ruido EMI) - log de pulsos omitido"); }
+  }
+  else while (hallPrinted < hallCount) {
     hallPrinted++;
     logln("EVENTO: hall pulso #" + String(hallPrinted) + " (+" + String(GRAMS_PER_PULSE,0) + " g, total " + String(hallPrinted*GRAMS_PER_PULSE,0) + " g)");
     if (runMode == MODE_REAL) greenPulseUntil = millis() + 100;
@@ -1501,6 +1594,13 @@ void setup() {
 
   loadPrefs();
 
+  // v12.9: watchdog del loop. Si el bucle se cuelga (p. ej. tormenta de ruido que
+  // sature el envio BLE), el equipo se REINICIA SOLO y arranca en SAFE (allSafe del
+  // setup), en vez de dejar un motor a 12V. Timeout amplio: el loop normal es <<1 s.
+  esp_task_wdt_config_t wdtCfg = { .timeout_ms = 12000, .idle_core_mask = 0, .trigger_panic = true };
+  if (esp_task_wdt_reconfigure(&wdtCfg) != ESP_OK) esp_task_wdt_init(&wdtCfg);
+  esp_task_wdt_add(NULL);   // suscribe el loopTask (Arduino no lo hace por defecto)
+
   // v8/P0-1: sistema de archivos para los eventos (formatea si es primera vez).
   if (!LittleFS.begin(true)) Serial.println("!! LittleFS no monto: eventos NO persistiran");
   if (sdEnabled) sdMount();   // v9.6: respaldo microSD si esta habilitado
@@ -1535,6 +1635,7 @@ void setup() {
 }
 
 void loop() {
+  esp_task_wdt_reset();   // v12.9: alimenta el watchdog en cada vuelta del loop
   gpsService();
   ioService();
   opLedService();   // v9.4: titileo del LED rojo mientras hay OPERACION
@@ -1556,6 +1657,8 @@ void loop() {
   dutyReportService();       // v8.5: PWM del GPIO del dosf en vivo
   timerService();
   hallService();
+  hallNoiseService();   // v12.9: auto-SAFE si el Hall enloquece por ruido EMI
+  hallRuidoLogService();  // v13.0: informe del ruido descartado por la ISR
   stallService();
   bootLedService();
   eventService();
