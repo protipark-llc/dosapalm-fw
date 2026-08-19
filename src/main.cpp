@@ -32,6 +32,7 @@
 #include <LittleFS.h>
 #include <SD.h>   // v9.6: respaldo opcional de eventos en microSD
 #include <Update.h>            // v11.9: OTA por comandos (app -> equipo)
+#include "soc/gpio_reg.h"      // v13.1: lectura de nivel directa al registro (segura en ISR)
 #include "mbedtls/base64.h"    // v11.9: trozos OTA en base64 por el protocolo de texto
 #include "esp_task_wdt.h"      // v12.9: watchdog del loop (auto-reset + SAFE si se cuelga)
 
@@ -42,7 +43,7 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "13.0";
+const char* FW_VERSION = "13.1";
 // v12.9: PROTECCION ANTI-RUIDO del Hall (motor de tolva de mayor potencia -> EMI
 // que inducia pulsos falsos, saturaba el log por BLE, colgaba el loop y dejaba la
 // tolva a 12V sin poder apagarla con SAFE). Cuatro capas: (1) compuerta de periodo
@@ -189,6 +190,14 @@ volatile uint32_t hallLastPulseMs = 0;
 volatile uint32_t hallLastEdgeUs = 0;   // ultimo flanco ACEPTADO (compuerta, us)
 uint32_t hallMinGapUs = 3000;           // ignora flancos < N us = glitch EMI (real ~100 ms). Cmd 'hallmin'
 float    hallHzMax    = 150.0;          // Hz de Hall IMPOSIBLE -> auto-SAFE (real ~10 Hz). Cmd 'hallmax'
+// v13.1: VALIDACION POR DURACION — hallazgo de campo: el ruido de la turbina
+// solo genera flancos de BAJADA con la linea en ALTO (reposo con pull-up) y
+// dura MICROsegundos; una cavidad real sostiene el BAJO MILIsegundos. La ISR
+// (en CHANGE) mide cuanto duro el BAJO y solo cuenta el pulso si supero
+// hallMinLowUs. El ruido no puede fingir un BAJO sostenido. Cmd 'hallpulso'.
+uint32_t hallMinLowUs = 2000;           // duracion minima del BAJO para contar (us)
+volatile uint32_t hallLowStartUs = 0;
+volatile bool     hallLowPend = false;
 uint32_t dosfStartMs = 0, dosfPulsesAtStart = 0;
 bool     bootLedDone = false;
 
@@ -307,10 +316,24 @@ uint32_t evtSeq = 0;
 volatile bool hallArmado = false;
 volatile uint32_t hallGraciaHasta = 0;
 volatile uint32_t hallRuidoIgn = 0;
+// v13.1: la ISR va en CHANGE. En la BAJADA solo se marca el candidato; el
+// pulso se cuenta en la SUBIDA, si el BAJO duro al menos hallMinLowUs (una
+// cavidad real = milisegundos; un glitch EMI de la turbina = microsegundos).
+// Lectura de nivel directa al registro (segura en IRAM).
 void IRAM_ATTR hallISR() {
-  if (!hallArmado && (int32_t)(millis() - hallGraciaHasta) > 0) { hallRuidoIgn++; return; }
   uint32_t now = micros();
-  if (now - hallLastEdgeUs < hallMinGapUs) { hallRuidoIgn++; return; }   // glitch EMI: descartar
+  bool nivel = (REG_READ(GPIO_IN_REG) >> PIN_HALL) & 1;
+  if (!nivel) {   // BAJO: candidato a pulso — arranca el cronometro
+    hallLowStartUs = now;
+    hallLowPend = true;
+    return;
+  }
+  // SUBIDA: validar la duracion del BAJO
+  if (!hallLowPend) return;
+  hallLowPend = false;
+  if (now - hallLowStartUs < hallMinLowUs) { hallRuidoIgn++; return; }            // glitch EMI
+  if (!hallArmado && (int32_t)(millis() - hallGraciaHasta) > 0) { hallRuidoIgn++; return; }
+  if (now - hallLastEdgeUs < hallMinGapUs) { hallRuidoIgn++; return; }            // compuerta entre pulsos
   hallLastEdgeUs = now;
   hallCount++;
   hallLastPulseMs = millis();
@@ -852,6 +875,7 @@ void loadPrefs() {
   btHoldMs = prefs.getULong("holdbt", 3000);          // v9.4
   btnMinMs = prefs.getULong("btnmin", 150);           // v10.3
   hallMinGapUs = prefs.getULong("hallmin", 3000);     // v12.9: compuerta anti-ruido Hall (us)
+  hallMinLowUs = prefs.getULong("hallpulso", 2000);   // v13.1: duracion minima del BAJO (us)
   hallHzMax    = prefs.getFloat("hallmax", 150.0);    // v12.9: Hz imposible -> auto-SAFE
   freqTurb = prefs.getULong("fturb", 5000);           // v8.4
   freqDosf = prefs.getULong("fdosf", 1000);
@@ -1110,6 +1134,18 @@ void handleCommand(String cmd, int ch) {
       prefs.begin("dosapalm", false); prefs.putULong("hallmin", hallMinGapUs); prefs.end();
       logln("Compuerta Hall = " + String(hallMinGapUs) + " us");
     } else logln("Uso: hallmin <0-50000> us (actual " + String(hallMinGapUs) + ")");
+  }
+  else if (t[0] == "hallpulso") {
+    // v13.1: duracion MINIMA del BAJO para aceptar un pulso (us). Una cavidad
+    // real sostiene el BAJO milisegundos; el ruido EMI de la turbina solo
+    // logra glitches de microsegundos. 0 = sin validacion (no recomendado).
+    uint32_t us = (uint32_t) t[1].toInt();
+    if (t[1].length() == 0) logln("Pulso Hall minimo = " + String(hallMinLowUs) + " us");
+    else if (us <= 50000) {
+      hallMinLowUs = us;
+      prefs.begin("dosapalm", false); prefs.putULong("hallpulso", hallMinLowUs); prefs.end();
+      logln("Pulso Hall minimo = " + String(hallMinLowUs) + " us");
+    } else logln("Uso: hallpulso <0-50000> us (actual " + String(hallMinLowUs) + ")");
   }
   else if (t[0] == "hallmax") {
     // v12.9: Hz de Hall imposible -> auto-SAFE. Debe ser MAYOR que el maximo real (~10-50 Hz).
@@ -1524,10 +1560,19 @@ void eventService() {
     static uint32_t tRuidoLog = 0;
     if (millis() - tRuidoLog > 1000) { tRuidoLog = millis(); logln("AVISO: rafaga anormal de pulsos hall (posible ruido EMI) - log de pulsos omitido"); }
   }
-  else while (hallPrinted < hallCount) {
-    hallPrinted++;
-    logln("EVENTO: hall pulso #" + String(hallPrinted) + " (+" + String(GRAMS_PER_PULSE,0) + " g, total " + String(hallPrinted*GRAMS_PER_PULSE,0) + " g)");
-    if (runMode == MODE_REAL) greenPulseUntil = millis() + 100;
+  else {
+    // v13.1: LIMITE DE TASA del log pulso a pulso — un diluvio de pulsos
+    // (ruido) imprimia cientos de lineas/s, saturaba las notificaciones BLE
+    // y tumbaba el GATT ("GATT Error Unknown" + desconexion). Maximo 10
+    // lineas/s; el resto se cuenta igual pero se loguea resumido.
+    static uint32_t tHallLogWin = 0; static uint8_t hallLogN = 0;
+    while (hallPrinted < hallCount) {
+      hallPrinted++;
+      if (millis() - tHallLogWin > 1000) { tHallLogWin = millis(); hallLogN = 0; }
+      if (hallLogN < 10) { hallLogN++; logln("EVENTO: hall pulso #" + String(hallPrinted) + " (+" + String(GRAMS_PER_PULSE,0) + " g, total " + String(hallPrinted*GRAMS_PER_PULSE,0) + " g)"); }
+      else if (hallLogN == 10) { hallLogN++; logln("AVISO: >10 pulsos/s — log pulso a pulso pausado 1 s (proteccion del Bluetooth); el conteo sigue completo"); }
+      if (runMode == MODE_REAL) greenPulseUntil = millis() + 100;
+    }
   }
   static bool prevFix = false; bool fix = gps.location.isValid();
   if (fix != prevFix) { prevFix = fix; logln(fix ? "EVENTO: GPS fix ADQUIRIDO" : "EVENTO: GPS fix PERDIDO"); }
@@ -1589,7 +1634,7 @@ void setup() {
   ledcAttachChannel(PIN_TURB, freqTurb, RES_TURB, 0);   // ch0 -> timer0
   ledcAttachChannel(PIN_DOSF, freqDosf, RES_MOT,  2);   // ch2 -> timer1
   ledcAttachChannel(PIN_TOL,  freqTol,  RES_MOT,  4);   // ch4 -> timer2
-  attachInterrupt(digitalPinToInterrupt(PIN_HALL), hallISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_HALL), hallISR, CHANGE);   // v13.1: mide la duracion del BAJO
   allSafe(); hallWindowStart = millis();
 
   loadPrefs();
