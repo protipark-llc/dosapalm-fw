@@ -43,7 +43,7 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "13.5";
+const char* FW_VERSION = "13.6";
 // v12.9: PROTECCION ANTI-RUIDO del Hall (motor de tolva de mayor potencia -> EMI
 // que inducia pulsos falsos, saturaba el log por BLE, colgaba el loop y dejaba la
 // tolva a 12V sin poder apagarla con SAFE). Cuatro capas: (1) compuerta de periodo
@@ -207,6 +207,11 @@ uint32_t hallStormMax = 400;            // flancos/s para cuarentena. Cmd 'halls
 bool     hallCuarentena = false;
 uint32_t hallCuarHasta = 0;
 uint8_t  hallStormSeguidas = 0;
+// v13.6: candado ANTI-BUCLE del reinicio de saneamiento — si el ultimo
+// reinicio ya fue por tormenta, NO se vuelve a reiniciar: cuarentena LARGA
+// (el sensor queda mudo pero el equipo vivo y conectable) hasta 'reset' o
+// hasta arreglar la linea. Evita el ciclo reinicio->tormenta->reinicio.
+bool hallStormReinicio = false;
 uint32_t dosfStartMs = 0, dosfPulsesAtStart = 0;
 bool     bootLedDone = false;
 
@@ -887,6 +892,9 @@ void loadPrefs() {
   hallMinGapUs = prefs.getULong("hallmin", 3000);     // v12.9: compuerta anti-ruido Hall (us)
   hallMinLowUs = prefs.getULong("hallpulso", 2000);   // v13.1: duracion minima del BAJO (us)
   hallStormMax = prefs.getULong("hallstorm", 400);    // v13.3: flancos/s -> cuarentena
+  // v13.6: ¿el ultimo reinicio fue de saneamiento por tormenta? (candado anti-bucle)
+  hallStormReinicio = prefs.getBool("stormrb", false);
+  if (hallStormReinicio) { prefs.putBool("stormrb", false); }
   hallHzMax    = prefs.getFloat("hallmax", 150.0);    // v12.9: Hz imposible -> auto-SAFE
   freqTurb = prefs.getULong("fturb", 5000);           // v8.4
   freqDosf = prefs.getULong("fdosf", 1000);
@@ -1500,10 +1508,20 @@ void hallStormService() {
     // completo del firmware. Los eventos estan persistidos y el equipo
     // arranca en modo normal, limpio.
     if (hallStormSeguidas >= 4) {
+      if (!hallStormReinicio) {
+        allSafe();
+        prefs.begin("dosapalm", false); prefs.putBool("stormrb", true); prefs.end();
+        logln("!! TORMENTA PERSISTENTE en el hall (4 cuarentenas seguidas) -> REINICIO de saneamiento del firmware...");
+        delay(600);
+        ESP.restart();
+      }
+      // v13.6: ya se reinicio una vez por tormenta y volvio a pasar: el
+      // problema es la LINEA, no el firmware. Sensor mudo 1 hora (o 'reset').
       allSafe();
-      logln("!! TORMENTA PERSISTENTE en el hall (4 cuarentenas seguidas) -> REINICIO de saneamiento del firmware...");
-      delay(600);
-      ESP.restart();
+      hallCuarentena = true;
+      hallCuarHasta = millis() + 3600000u;
+      logln("!! TORMENTA CRONICA: ya hubo un reinicio de saneamiento y persiste -> sensor en cuarentena LARGA (1 h o comando 'reset'). ARREGLAR la linea del hall (pull-up/cableado)");
+      return;
     }
     uint32_t cuarMs = 5000u * hallStormSeguidas;
     hallCuarHasta = millis() + cuarMs;
@@ -1755,6 +1773,28 @@ void setup() {
   Serial.println();
   Serial.println("=====================================================");
   Serial.printf ("  DOSAPALM FIRMWARE v%s (fuente unica: dosapalm/firmware)\n", FW_VERSION);
+  // v13.6: MOTIVO DEL REINICIO — la clave para diagnosticar reinicios en
+  // campo: BROWNOUT = la fuente se desploma (motor arrancando, faltan
+  // condensadores); SW = reinicio ordenado (reset/ota/fabrica/tormenta);
+  // PANIC/WDT = bug del firmware; POWERON = encendido normal.
+  {
+    esp_reset_reason_t rr = esp_reset_reason();
+    const char* motivo = "DESCONOCIDO";
+    switch (rr) {
+      case ESP_RST_POWERON:  motivo = "POWERON (encendido normal)"; break;
+      case ESP_RST_SW:       motivo = "SW (reinicio ordenado por el firmware)"; break;
+      case ESP_RST_PANIC:    motivo = "PANIC (crash del firmware - reportar)"; break;
+      case ESP_RST_INT_WDT:  motivo = "WDT-INT (watchdog de interrupciones)"; break;
+      case ESP_RST_TASK_WDT: motivo = "WDT-TAREA (tarea colgada)"; break;
+      case ESP_RST_WDT:      motivo = "WDT (watchdog general)"; break;
+      case ESP_RST_BROWNOUT: motivo = "BROWNOUT (la alimentacion se DESPLOMO - revisar fuente/condensadores del motor)"; break;
+      case ESP_RST_DEEPSLEEP:motivo = "DEEPSLEEP"; break;
+      case ESP_RST_EXT:      motivo = "EXT (pin de reset)"; break;
+      default: break;
+    }
+    Serial.printf("  MOTIVO DEL REINICIO: %s\n", motivo);
+    if (rr == ESP_RST_BROWNOUT) Serial.println("  !! BROWNOUT: agregar 470-1000 uF en la entrada de 12V y separar la alimentacion del ESP32 de la de los motores");
+  }
   Serial.printf ("  Serial: %s | Conexion: %s | EVT pendientes: %lu\n", devSerial.c_str(), connMode==CONN_BLE?"BLE":"WiFi", (unsigned long)evtCount());
   if (wifiActive) Serial.printf("  WiFi '%s' -> WS ws://%s:%u/ | TCP :%u\n", devSerial.c_str(), WiFi.softAPIP().toString().c_str(), WS_PORT, TCP_PORT);
   else            Serial.printf("  BLE UART: busca '%s' por Bluetooth en la app\n", devSerial.c_str());
