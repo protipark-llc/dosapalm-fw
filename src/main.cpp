@@ -43,7 +43,7 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "13.7";
+const char* FW_VERSION = "13.8";
 // v12.9: PROTECCION ANTI-RUIDO del Hall (motor de tolva de mayor potencia -> EMI
 // que inducia pulsos falsos, saturaba el log por BLE, colgaba el loop y dejaba la
 // tolva a 12V sin poder apagarla con SAFE). Cuatro capas: (1) compuerta de periodo
@@ -1492,6 +1492,12 @@ void hallStormService() {
     hallCuarentena = false;
     prevEdges = hallEdgesRaw; tWin = millis();
     hallLowPend = false;
+    // v13.8: RE-BASE del guardian de atasco — durante la cuarentena no hubo
+    // pulsos (sensor mudo): sin esto, al reactivar dispararia un falso ATASCO
+    // con el motor girando bien.
+    hallLastPulseMs = millis();
+    dosfStartMs = millis();
+    dosfPulsesAtStart = hallCount;
     attachInterrupt(digitalPinToInterrupt(PIN_HALL), hallISR, CHANGE);
     logln("HALL: fin de la cuarentena - sensor reactivado (vigilando la tasa de flancos)");
     return;
@@ -1525,13 +1531,21 @@ void hallStormService() {
     }
     uint32_t cuarMs = 5000u * hallStormSeguidas;
     hallCuarHasta = millis() + cuarMs;
-    if (dosState != DOS_IDLE) {
-      uint32_t p = hallCount - dosStartPulses;
-      emitDoseEvent(p, p * GRAMS_PER_PULSE, "error");
-      dosState = DOS_IDLE; lastCycleEndMs = millis();
+    // v13.8: el conteo es INMUNE al ruido (validacion por duracion), asi que
+    // la tormenta solo es peligrosa con una DOSIS o CALIBRACION en curso (ahi
+    // el conteo manda y hay que abortar). En pruebas manuales de banco los
+    // motores SIGUEN girando: solo se silencia el sensor.
+    if (dosState != DOS_IDLE || calActive) {
+      if (dosState != DOS_IDLE) {
+        uint32_t p = hallCount - dosStartPulses;
+        emitDoseEvent(p, p * GRAMS_PER_PULSE, "error");
+        dosState = DOS_IDLE; lastCycleEndMs = millis();
+      }
+      allSafe();
+      logln("!! TORMENTA DE RUIDO en el hall: " + String(porSeg) + " flancos/s (max " + String(hallStormMax) + ") -> dosis/calibracion ABORTADA, SAFE y sensor en CUARENTENA " + String(cuarMs/1000) + " s. Revisar pull-up y cableado");
+    } else {
+      logln("!! TORMENTA DE RUIDO en el hall: " + String(porSeg) + " flancos/s (max " + String(hallStormMax) + ") -> sensor en CUARENTENA " + String(cuarMs/1000) + " s (los motores SIGUEN: no hay dosis en curso y el conteo esta protegido). Revisar pull-up y cableado");
     }
-    allSafe();
-    logln("!! TORMENTA DE RUIDO en el hall: " + String(porSeg) + " flancos/s (max " + String(hallStormMax) + ") -> SAFE y sensor en CUARENTENA " + String(cuarMs/1000) + " s. Linea flotante/EMI: revisar pull-up y cableado");
   } else if (porSeg < 50 && hallStormSeguidas > 0) hallStormSeguidas--;
 }
 // v13.0: reporte periodico del ruido DESCARTADO (no cuenta, pero se informa
@@ -1558,6 +1572,7 @@ void hallNoiseService() {
 }
 void stallService() {
   if (!dosfStallGuard || dosfPct == 0) return;
+  if (hallCuarentena) return;   // v13.8: sensor mudo = sin informacion para juzgar atasco
   // v8.3: el guardian usa el timeout CONFIGURABLE ('atasco <ms>') y ademas
   // escala con el retardo objetivo (500 ms/cavidad no es atasco).
   int guardTarget = calActive ? calRetardoMs : retardoMs;
