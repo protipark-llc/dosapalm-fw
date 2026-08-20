@@ -43,7 +43,7 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "13.6";
+const char* FW_VERSION = "13.7";
 // v12.9: PROTECCION ANTI-RUIDO del Hall (motor de tolva de mayor potencia -> EMI
 // que inducia pulsos falsos, saturaba el log por BLE, colgaba el loop y dejaba la
 // tolva a 12V sin poder apagarla con SAFE). Cuatro capas: (1) compuerta de periodo
@@ -1347,7 +1347,7 @@ void handleCommand(String cmd, int ch) {
   }
   else if (t[0] == "atasco")  {
     int ms = (int)t[1].toInt();
-    if (ms < 500) logln("Uso: atasco <ms> (minimo 500). Actual: " + String(hallTimeoutMs) + " ms");
+    if (ms < 1500) logln("Uso: atasco <ms> (minimo 1500 - el piñon tarda ~500 ms en el primer pulso). Actual: " + String(hallTimeoutMs) + " ms");
     else {
       hallTimeoutMs = (uint32_t)ms;
       prefs.begin("dosapalm", false); prefs.putULong("atascoms", hallTimeoutMs); prefs.end();
@@ -1561,8 +1561,13 @@ void stallService() {
   // v8.3: el guardian usa el timeout CONFIGURABLE ('atasco <ms>') y ademas
   // escala con el retardo objetivo (500 ms/cavidad no es atasco).
   int guardTarget = calActive ? calRetardoMs : retardoMs;
-  uint32_t sensorMs = max(hallTimeoutMs, (uint32_t)guardTarget * 4);
-  uint32_t jamMs    = max(hallTimeoutMs, (uint32_t)guardTarget * 4);
+  // v13.7: PISO FISICO de 1500 ms — caso de campo: con 'atasco 500' el paro
+  // era matematicamente inevitable (primer pulso real desde reposo ~530 ms y
+  // cadencia ~500-600 ms). El guardian jamas puede exigir mas rapidez que la
+  // fisica del piñon, configure lo que se configure.
+  const uint32_t GUARD_PISO_MS = 1500;
+  uint32_t sensorMs = max(max(hallTimeoutMs, (uint32_t)guardTarget * 4), GUARD_PISO_MS);
+  uint32_t jamMs    = sensorMs;
   bool huboPulsos = (hallCount != dosfPulsesAtStart);
   bool enDosis = (dosState != DOS_IDLE);
   // v13.2: FALSO ATASCO de campo — carrera entre millis() y la ISR: si un
