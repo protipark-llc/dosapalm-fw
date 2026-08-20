@@ -43,7 +43,7 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "13.4";
+const char* FW_VERSION = "13.5";
 // v12.9: PROTECCION ANTI-RUIDO del Hall (motor de tolva de mayor potencia -> EMI
 // que inducia pulsos falsos, saturaba el log por BLE, colgaba el loop y dejaba la
 // tolva a 12V sin poder apagarla con SAFE). Cuatro capas: (1) compuerta de periodo
@@ -1555,18 +1555,30 @@ void stallService() {
   uint32_t ahora = millis();
   int32_t sinPulso     = (int32_t)(ahora - hallLastPulseMs);
   int32_t desdeArranque = (int32_t)(ahora - dosfStartMs);
-  // v9.5: cualquier atasco/fallo de hall durante la dosificacion dispara SAFE
-  // COMPLETO — turbina, dosificador, tolva y secuencias, todo apagado.
-  if (!huboPulsos && desdeArranque > (int32_t)sensorMs) {
-    if (enDosis) { uint32_t p = hallCount - dosStartPulses; emitDoseEvent(p, p*GRAMS_PER_PULSE, "error"); dosState=DOS_IDLE; lastCycleEndMs = millis(); }
-    allSafe();
-    logln("!! SENSOR HALL NO DETECTADO -> SAFE: todos los motores apagados. Revisar sensor/iman");
+  // v13.5: ATASCO CONFIRMADO POR STRIKES — el guardian ya no dispara con UN
+  // solo chequeo (una lectura rara/glitch = SAFE injusto): evalua cada 400 ms
+  // y exige la condicion en DOS chequeos SEGUIDOS. Un pulso real entre medio
+  // resetea el conteo. El retardo extra (400 ms) es irrelevante frente a los
+  // umbrales (>=2.8 s) y elimina los paros por rareza puntual.
+  static uint8_t  stallStrikes = 0;
+  static uint32_t tStallChk = 0;
+  if (ahora - tStallChk < 400) return;
+  tStallChk = ahora;
+  bool condSensor = !huboPulsos && desdeArranque > (int32_t)sensorMs;
+  bool condJam    =  huboPulsos && sinPulso      > (int32_t)jamMs;
+  if (!condSensor && !condJam) { stallStrikes = 0; return; }
+  stallStrikes++;
+  if (stallStrikes < 2) {
+    logln("AVISO: posible " + String(condJam ? "ATASCO (hall callado)" : "SENSOR SIN PULSOS") + " — confirmando en 400 ms (1/2)...");
+    return;
   }
-  else if (huboPulsos && sinPulso > (int32_t)jamMs) {
-    if (enDosis) { uint32_t p = hallCount - dosStartPulses; emitDoseEvent(p, p*GRAMS_PER_PULSE, "error"); dosState=DOS_IDLE; lastCycleEndMs = millis(); }
-    allSafe();
-    logln("!! ATASCO: hall callo -> SAFE: todos los motores apagados. Revisar pinon/granulos");
-  }
+  stallStrikes = 0;
+  // v9.5: atasco CONFIRMADO -> SAFE COMPLETO (turbina, dosificador, tolva y
+  // secuencias) y, si habia dosis en curso, evento de error con lo alcanzado.
+  if (enDosis) { uint32_t p = hallCount - dosStartPulses; emitDoseEvent(p, p*GRAMS_PER_PULSE, "error"); dosState=DOS_IDLE; lastCycleEndMs = millis(); }
+  allSafe();
+  if (condJam) logln("!! ATASCO CONFIRMADO (2/2): hall callo -> SAFE: todos los motores apagados. Revisar pinon/granulos");
+  else         logln("!! SENSOR HALL NO DETECTADO (2/2) -> SAFE: todos los motores apagados. Revisar sensor/iman");
 }
 void bootLedService() { if (!bootLedDone && millis() >= 500) { bootLedDone = true; digitalWrite(PIN_LED_R, HIGH); logln("LED POWER (rojo) ON @ 500ms"); } }
 void timerService() {
