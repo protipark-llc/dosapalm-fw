@@ -43,7 +43,7 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "13.8";
+const char* FW_VERSION = "14.0";
 // v12.9: PROTECCION ANTI-RUIDO del Hall (motor de tolva de mayor potencia -> EMI
 // que inducia pulsos falsos, saturaba el log por BLE, colgaba el loop y dejaba la
 // tolva a 12V sin poder apagarla con SAFE). Cuatro capas: (1) compuerta de periodo
@@ -584,7 +584,9 @@ void emitDoseEvent(uint32_t pulses, float grams, const char* resultado) {
   double la = fix ? gps.location.lat() : (hasLastFix ? lastFixLat : 0.0);
   double lo = fix ? gps.location.lng() : (hasLastFix ? lastFixLon : 0.0);
   char ts[24] = "-";
-  if (gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2020) {
+  // v14.0: SOLO con fix y anio sano — sin fix el modulo entrega fechas basura
+  // "validas" (2080-01-06) que contaminaban la base de datos.
+  if (gps.location.isValid() && gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2024 && gps.date.year() <= 2045) {
     snprintf(ts, sizeof(ts), "%04d-%02d-%02dT%02d:%02d:%02dZ",
              gps.date.year(), gps.date.month(), gps.date.day(),
              gps.time.hour(), gps.time.minute(), gps.time.second());
@@ -1382,6 +1384,12 @@ void handleCommand(String cmd, int ch) {
 // ---------------- BLE ----------------
 class ServerCB : public BLEServerCallbacks {
   void onConnect(BLEServer* s) override { bleConnected = true; bleLastRxMs = millis(); }
+  // v14.0: enlace TOLERANTE — intervalo 15-30 ms y supervision timeout 4 s (en
+  // vez de ~1-2 s): un microcorte de radio/alimentacion ya no tumba la conexion.
+  void onConnect(BLEServer* s, esp_ble_gatts_cb_param_t* param) override {
+    bleConnected = true; bleLastRxMs = millis();
+    s->updateConnParams(param->connect.remote_bda, 0x0C, 0x18, 0, 400);
+  }
   void onDisconnect(BLEServer* s) override {
     bleConnected = false;
     authed[CH_BT] = false;   // v8/P1-6: cada conexion BLE debe autorizarse de nuevo
@@ -1396,11 +1404,30 @@ class RxCB : public BLECharacteristicCallbacks {
     for (int i = 0; i < (int)v.length(); i++) { uint16_t nh = (bleHead + 1) % sizeof(bleRing); if (nh != bleTail) { bleRing[bleHead] = v[i]; bleHead = nh; } }
   }
 };
+// v14.0: notificaciones BLE CON RITMO — una rafaga (ACTIVA + repeticion + status
+// de 12 lineas al iniciar operacion) sin espaciado saturaba la cola de la pila
+// BLE: el telefono veia errores GATT y SOLTABA el enlace. Ahora: (a) el '\n' va
+// pegado al ultimo trozo (mitad de notificaciones), (b) minimo 12 ms entre
+// notificaciones (un evento de conexion BLE tipico); el trafico esporadico no
+// se retrasa y solo las rafagas se estiran unos ms.
+static uint32_t bleLastNotifyUs = 0;
+static void bleNotifyPaced(const uint8_t* d, size_t k) {
+  int32_t falta = (int32_t)(12000 - (micros() - bleLastNotifyUs));
+  if (falta > 0 && falta <= 12000) delay((falta + 999) / 1000);   // cede CPU a la tarea BLE
+  pTxChar->setValue((uint8_t*)d, k); pTxChar->notify();
+  bleLastNotifyUs = micros();
+}
 void bleNotifyLine(const char* s, size_t n) {
   if (!bleConnected || pTxChar == nullptr) return;
   const size_t CH = 180;
-  for (size_t i = 0; i < n; i += CH) { size_t k = (n-i<CH)?(n-i):CH; pTxChar->setValue((uint8_t*)(s+i), k); pTxChar->notify(); }
-  uint8_t nl = '\n'; pTxChar->setValue(&nl, 1); pTxChar->notify();
+  static uint8_t buf[CH + 1];
+  if (n == 0) { uint8_t nl = '\n'; bleNotifyPaced(&nl, 1); return; }
+  for (size_t i = 0; i < n; i += CH) {
+    size_t k = (n - i < CH) ? (n - i) : CH;
+    memcpy(buf, s + i, k);
+    if (i + k >= n) buf[k++] = '\n';   // fin de linea en el MISMO paquete
+    bleNotifyPaced(buf, k);
+  }
 }
 void bleSetup() {
   BLEDevice::init(devSerial.c_str());
