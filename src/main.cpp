@@ -43,7 +43,7 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "14.0";
+const char* FW_VERSION = "14.2";
 // v12.9: PROTECCION ANTI-RUIDO del Hall (motor de tolva de mayor potencia -> EMI
 // que inducia pulsos falsos, saturaba el log por BLE, colgaba el loop y dejaba la
 // tolva a 12V sin poder apagarla con SAFE). Cuatro capas: (1) compuerta de periodo
@@ -104,6 +104,12 @@ const int      TURB_DUTY_MAX  = 255;
 const int      TURB_PCT_RECOM = 78;
 const int      TURB_RAMP_STEP = 5;
 const uint32_t TURB_RAMP_MS   = 40;
+// v14.2: RAMPA CONFIGURABLE de la turbina — tiempo (ms) para ir de 0 a 100 %
+// de duty, igual al subir que al bajar (persistente, cmd 'rampa', en el diff
+// de la app). Antes era fija (5/255 cada 40 ms ≈ 2 s a fondo): demasiado
+// rapida para notarse frente a la inercia del motor.
+uint32_t turbRampaMs = 2000;
+float    turbDutyF   = 0.0f;   // acumulador fino de la rampa
 
 const float    GRAMS_PER_PULSE = 2.0;
 bool dosfStallGuard = true;
@@ -466,14 +472,23 @@ void setTurb(int pct) {
   if (turbPct > TURB_PCT_RECOM) logln("AVISO: turbina por encima del maximo recomendado (" + String(TURB_PCT_RECOM) + "%)");
 }
 void turbUpdate() {
-  if (turbDutyNow == turbDutyTarget) return;
-  if (millis() - tTurbRamp < TURB_RAMP_MS) return;
-  tTurbRamp = millis();
-  if (turbDutyNow < turbDutyTarget) turbDutyNow = min(turbDutyNow + TURB_RAMP_STEP, turbDutyTarget);
-  else                              turbDutyNow = max(turbDutyNow - TURB_RAMP_STEP, turbDutyTarget);
+  if (turbDutyNow == turbDutyTarget) { turbDutyF = turbDutyNow; return; }
+  uint32_t now = millis();
+  if (now - tTurbRamp < 20) return;
+  // v14.2: paso proporcional al tiempo transcurrido y a la rampa configurada
+  // (255 unidades de duty en turbRampaMs). Un SAFE sigue cortando en seco
+  // (allSafe pone duty 0 directo): la rampa es para operacion normal.
+  if (fabsf(turbDutyF - (float)turbDutyNow) > 1.5f) turbDutyF = turbDutyNow;   // re-sincronizar tras cortes directos
+  float dt = (float)(now - tTurbRamp); tTurbRamp = now;
+  float paso = 255.0f * dt / (float)max((uint32_t)100, turbRampaMs);
+  if (turbDutyNow < turbDutyTarget) turbDutyF = min(turbDutyF + paso, (float)turbDutyTarget);
+  else                              turbDutyF = max(turbDutyF - paso, (float)turbDutyTarget);
+  int nuevo = (int)(turbDutyF + 0.5f);
+  if (nuevo == turbDutyNow) return;
+  turbDutyNow = nuevo;
   ledcWrite(PIN_TURB, turbDutyNow);
   ledMirror();
-  if (turbDutyNow == turbDutyTarget) logln("TURB rampa completada");
+  if (turbDutyNow == turbDutyTarget) logln("TURB rampa completada (" + String(turbRampaMs) + " ms/100%)");
 }
 void setDosf(int pct) {
   pct = constrain(pct, 0, 100);
@@ -526,15 +541,22 @@ uint32_t evtCount() {
   f.close();
   return n;
 }
-void evtSince(uint32_t since) {
+// v14.1: DESCARGA POR PAGINAS — `evt since <seq> [max]`. Con cientos de
+// eventos pendientes, mandarlos todos de golpe desbordaba la cola BLE del
+// telefono (intervalos de 30-50 ms) y tumbaba el enlace aunque hubiera ritmo.
+// Con `max`, se envian como mucho esas lineas y el cierre informa cuantas
+// quedan: "EVT END <enviadas> <restantes>". La app confirma y purga cada
+// pagina antes de pedir la siguiente. Sin `max` = comportamiento anterior.
+void evtSince(uint32_t since, uint32_t maxLineas = 0) {
   File f = LittleFS.open(EVT_FILE, FILE_READ);
   if (!f) { out.println("EVT EMPTY"); return; }
-  uint32_t sent = 0;
+  uint32_t sent = 0, restantes = 0;
   while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
     if (line.length() == 0) continue;
     if (evtLineSeq(line) > since) {
+      if (maxLineas > 0 && sent >= maxLineas) { restantes++; continue; }
       out.println(line);
       sent++;
       // v11.5: ritmo en la rafaga — sin pausa, la pila BLE descarta
@@ -545,11 +567,11 @@ void evtSince(uint32_t since) {
     }
   }
   f.close();
-  out.printf("EVT END %lu\n", (unsigned long)sent);
+  out.printf("EVT END %lu %lu\n", (unsigned long)sent, (unsigned long)restantes);
   // v11.5: EVT END es la linea que AUTORIZA la purga — repetirla cubre la
   // perdida de una notificacion BLE. La app ignora el duplicado.
   delay(180);
-  out.printf("EVT END %lu\n", (unsigned long)sent);
+  out.printf("EVT END %lu %lu\n", (unsigned long)sent, (unsigned long)restantes);
 }
 void evtAck(uint32_t upTo) {
   File src = LittleFS.open(EVT_FILE, FILE_READ);
@@ -875,6 +897,7 @@ void loadPrefs() {
   hallTimeoutMs = prefs.getULong("atascoms", 4000);   // v8.3
   dutyFijoPct = prefs.getInt("dutyfijo", 0);          // v8.8
   rearmeMs = prefs.getULong("rearmems", 5000);        // v9.1
+  turbRampaMs = prefs.getULong("rampa", 2000);        // v14.2: rampa de la turbina
   cfgOk = prefs.getBool("cfgok", false);              // v9.2
   // v10.1: parametros de dosificacion PERSISTIDOS (comando `guardar`) — son
   // los que usa el boton fisico tras un reinicio, sin app.
@@ -945,7 +968,7 @@ void printStatus() {
   out.printf("  Pulsador: operacion %lu ms | bluetooth %lu ms | antirebote %lu ms\n", opHoldMs, btHoldMs, btnMinMs);
   out.printf("  TURB: %d%% | DOSF: %d%% | TOL: %d%% | SEQ: %s\n", turbPct, dosfPct, tolPct, seqCur?seqName:"ninguna");
   out.printf("  Dosif: dosis %dg, retardo %dms, tini %dms, tfin %dms, turbReal %d%%, dutyFijo %d%% | estado: %d\n", dosisG, retardoMs, tIniMs, tFinMs, turbRealPct, dutyFijoPct, (int)dosState);
-  out.printf("  PWM: turb %lu Hz | dosf %lu Hz | tol %lu Hz | atasco %lu ms | rearme %lu ms\n", freqTurb, freqDosf, freqTol, hallTimeoutMs, rearmeMs);
+  out.printf("  PWM: turb %lu Hz | dosf %lu Hz | tol %lu Hz | atasco %lu ms | rearme %lu ms | rampa %lu ms\n", freqTurb, freqDosf, freqTol, hallTimeoutMs, rearmeMs, turbRampaMs);
   out.printf("  AUX: %s | LD: %s | LOG: %s | MON: %s cada %lums\n", auxOn?"ON":"off", ldOn?"ON":"off", logOn?"ON":"off", monOn?"ON":"off", monIntervalMs);
   out.printf("  HALL: %lu pulsos, %.1f Hz, %.0f g | BTN: %s\n", hallCount, hallHz, hallCount*GRAMS_PER_PULSE, digitalRead(PIN_BTN)==LOW?"PRESIONADO":"libre");
   out.printf("  EVT pendientes: %lu (seq %lu)\n", (unsigned long)evtCount(), (unsigned long)evtSeq);   // v8
@@ -1073,7 +1096,7 @@ void handleCommand(String cmd, int ch) {
   // v8/P0-1: eventos persistidos
   else if (t[0] == "evt") {
     if (t[1] == "count")      out.printf("EVT COUNT %lu\n", (unsigned long)evtCount());
-    else if (t[1] == "since") evtSince((uint32_t) t[2].toInt());
+    else if (t[1] == "since") evtSince((uint32_t) t[2].toInt(), (uint32_t) t[3].toInt());   // v14.1: [max] = pagina
     else if (t[1] == "ack")   evtAck((uint32_t) t[2].toInt());
     else logln("Uso: evt count | evt since <seq> | evt ack <seq>");
   }
@@ -1336,6 +1359,16 @@ void handleCommand(String cmd, int ch) {
     logln("FABRICA OK: configuracion borrada por completo (serial, secuencia y datos pendientes conservados). Reiniciando...");
     delay(400);
     ESP.restart();
+  }
+  else if (t[0] == "rampa") {
+    // v14.2: rampa de la turbina — ms para ir de 0 a 100 % (y de 100 a 0). Persistente.
+    int ms = (int)t[1].toInt();
+    if (t[1].length() == 0) logln("Rampa turbina = " + String(turbRampaMs) + " ms (0->100%)");
+    else if (ms >= 200 && ms <= 20000) {
+      turbRampaMs = (uint32_t)ms;
+      prefs.begin("dosapalm", false); prefs.putULong("rampa", turbRampaMs); prefs.end();
+      logln("Rampa turbina = " + String(turbRampaMs) + " ms (0->100%)");
+    } else logln("Uso: rampa <200-20000> ms (actual " + String(turbRampaMs) + ")");
   }
   else if (t[0] == "rearme") {
     // v9.1: ventana anti-repeticion tras cada ciclo (persistente; 0 = sin bloqueo)
