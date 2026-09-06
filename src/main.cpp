@@ -43,7 +43,7 @@
  * avisa si la tarjeta esta desactualizada. El comando `version` responde
  * "VERSION <n>" y la app lo parsea.
  */
-const char* FW_VERSION = "14.2";
+const char* FW_VERSION = "14.3";
 // v12.9: PROTECCION ANTI-RUIDO del Hall (motor de tolva de mayor potencia -> EMI
 // que inducia pulsos falsos, saturaba el log por BLE, colgaba el loop y dejaba la
 // tolva a 12V sin poder apagarla con SAFE). Cuatro capas: (1) compuerta de periodo
@@ -467,6 +467,9 @@ uint32_t tTurbRamp = 0;
 void setTurb(int pct) {
   turbPct = constrain(pct, 0, 100);
   turbDutyTarget = pctToDuty(turbPct, TURB_DUTY_MAX);
+  tTurbRamp = millis();   // v14.3: la rampa arranca AHORA. Antes tTurbRamp quedaba
+                          // viejo (segundos) y el primer paso saltaba directo al
+                          // objetivo: "rampa completada" 2 ms despues del objetivo.
   ledMirror();
   logln("TURB objetivo=" + String(turbPct) + "% (duty " + String(turbDutyTarget) + "/255, tope " + String(TURB_DUTY_MAX) + ") - rampa en curso");
   if (turbPct > TURB_PCT_RECOM) logln("AVISO: turbina por encima del maximo recomendado (" + String(TURB_PCT_RECOM) + "%)");
@@ -479,7 +482,8 @@ void turbUpdate() {
   // (255 unidades de duty en turbRampaMs). Un SAFE sigue cortando en seco
   // (allSafe pone duty 0 directo): la rampa es para operacion normal.
   if (fabsf(turbDutyF - (float)turbDutyNow) > 1.5f) turbDutyF = turbDutyNow;   // re-sincronizar tras cortes directos
-  float dt = (float)(now - tTurbRamp); tTurbRamp = now;
+  uint32_t dtMs = now - tTurbRamp; if (dtMs > 60) dtMs = 60;   // v14.3: nunca un salto grande
+  float dt = (float)dtMs; tTurbRamp = now;
   float paso = 255.0f * dt / (float)max((uint32_t)100, turbRampaMs);
   if (turbDutyNow < turbDutyTarget) turbDutyF = min(turbDutyF + paso, (float)turbDutyTarget);
   else                              turbDutyF = max(turbDutyF - paso, (float)turbDutyTarget);
